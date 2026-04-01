@@ -3994,8 +3994,8 @@ fn multisig_setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Address
     owners.push_back(owner2.clone());
     owners.push_back(owner3.clone());
 
-    // 2-of-3 threshold
-    client.init_multisig(&caller, &owners, &2);
+    // 2-of-3 threshold with 86400s (1 day) duration
+    client.init_multisig(&caller, &owners, &2, &86400);
 
     (env, client, owner1, owner2, owner3, caller)
 }
@@ -4018,7 +4018,7 @@ fn multisig_init_twice_fails() {
 
     let mut owners2 = Vec::new(&env);
     owners2.push_back(owner1.clone());
-    let r = client.try_init_multisig(&caller, &owners2, &1);
+    let r = client.try_init_multisig(&caller, &owners2, &1, &86400);
     assert!(r.is_err());
 }
 
@@ -4035,7 +4035,7 @@ fn multisig_init_zero_threshold_fails() {
 
     let mut owners = Vec::new(&env);
     owners.push_back(owner.clone());
-    let r = client.try_init_multisig(&caller, &owners, &0);
+    let r = client.try_init_multisig(&caller, &owners, &0, &86400);
     assert!(r.is_err());
 }
 
@@ -4053,7 +4053,7 @@ fn multisig_init_threshold_exceeds_owners_fails() {
     let mut owners = Vec::new(&env);
     owners.push_back(owner.clone());
     // threshold=2 but only 1 owner
-    let r = client.try_init_multisig(&caller, &owners, &2);
+    let r = client.try_init_multisig(&caller, &owners, &2, &86400);
     assert!(r.is_err());
 }
 
@@ -4066,7 +4066,7 @@ fn multisig_init_empty_owners_fails() {
     let issuer = caller.clone();
 
     let owners = Vec::new(&env);
-    let r = client.try_init_multisig(&caller, &owners, &1);
+    let r = client.try_init_multisig(&caller, &owners, &1, &86400);
     assert!(r.is_err());
 }
 
