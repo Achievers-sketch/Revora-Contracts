@@ -9,6 +9,9 @@ use soroban_sdk::{
 // Issue #109 — Revenue report correction workflow with audit trail.
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
+#[cfg(test)]
+mod test_duplicates;
+
 /// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1309,6 +1312,18 @@ impl RevoraRevenueShare {
             return Err(RevoraError::InvalidRevenueShareBps);
         }
 
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Duplicate prevention: check if offering already exists by its stable identity (issuer+namespace+token)
+        // This makes register_offering idempotent and prevents state inconsistencies in off-chain catalogs.
+        if env.storage().persistent().has(&DataKey::OfferingIssuer(offering_id.clone())) {
+            return Ok(());
+        }
+
         // Register namespace for issuer if not already present
         let ns_reg_key = DataKey2::NamespaceRegistered(issuer.clone(), namespace.clone());
         if !env.storage().persistent().has(&ns_reg_key) {
@@ -1336,12 +1351,7 @@ impl RevoraRevenueShare {
         let item_key = DataKey::OfferItem(tenant_id.clone(), count);
         env.storage().persistent().set(&item_key, &offering);
         env.storage().persistent().set(&count_key, &(count + 1));
-
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
+        
         let issuer_lookup_key = DataKey::OfferingIssuer(offering_id.clone());
         env.storage().persistent().set(&issuer_lookup_key, &issuer);
 
