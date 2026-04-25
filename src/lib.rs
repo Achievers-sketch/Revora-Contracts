@@ -4304,6 +4304,19 @@ impl RevoraRevenueShare {
 
     pub const MAX_MULTISIG_OWNERS: u32 = 20;
 
+    fn require_multisig_owner(env: &Env, caller: &Address) -> Result<(), RevoraError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigOwners)
+            .ok_or(RevoraError::NotInitialized)?;
+        if owners.contains(caller) {
+            Ok(())
+        } else {
+            Err(RevoraError::NotAuthorized)
+        }
+    }
+
     /// Initialize the multisig admin system. May only be called once.
     /// Only the caller (deployer/admin) needs to authorize; owners are registered
     /// without requiring their individual signatures at init time.
@@ -4428,15 +4441,19 @@ impl RevoraRevenueShare {
         }
 
         proposal.approvals.push_back(approver.clone());
-        env.storage().persistent().set(&key, &proposal);
+        env.events().publish((EVENT_PROPOSAL_APPROVED, approver.clone()), proposal_id);
 
-        env.events().publish((EVENT_PROPOSAL_APPROVED, approver), proposal_id);
-        Ok(())
-    }
+        let threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .ok_or(RevoraError::NotInitialized)?;
 
-#![no_std]
+        if proposal.approvals.len() < threshold {
+            env.storage().persistent().set(&key, &proposal);
+            return Ok(());
+        }
 
-        // Execute the action
         match proposal.action.clone() {
             ProposalAction::SetAdmin(new_admin) => {
                 env.storage().persistent().set(&DataKey::Admin, &new_admin);
@@ -4503,8 +4520,15 @@ impl RevoraRevenueShare {
             }
         }
 
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.events().publish((EVENT_PROPOSAL_EXECUTED, proposal.proposer, proposal_id), ());
+        Ok(())
+    }
+
 // ─── Storage key types ────────────────────────────────────────────────────────
 
+/*
 /// Top-level storage keys stored in persistent contract storage.
 #[contracttype]
 #[derive(Clone)]
@@ -4966,6 +4990,26 @@ impl RevenueDepositContract {
             }
         }
         env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    */
+    fn get_effective_fee_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OfferingFeeBps(offering_id, asset.clone()))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, u32>(&DataKey::PlatformFeePerAsset(asset))
+            })
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0))
     }
 
     /// Calculate a fee quote for `(offering, asset, amount)` using the effective fee bps.
