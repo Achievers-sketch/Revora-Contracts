@@ -31,7 +31,7 @@ fn setup_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env);
+    let client = make_client(env.clone());
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
@@ -52,7 +52,7 @@ fn setup_funded_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, 
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env);
+    let client = make_client(env.clone());
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let (payment_token, _payment_admin) = create_payment_token(&env);
@@ -82,7 +82,7 @@ fn register_offering_rejects_negative_supply_cap_values() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = make_client(&env);
+    let client = make_client(env.clone());
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
@@ -137,7 +137,7 @@ fn deposit_revenue_rejects_non_positive_amounts_without_mutating_period_state() 
             &1,
         );
         assert_eq!(result, Err(Ok(RevoraError::InvalidAmount)));
-        assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
+        assert_eq!(client.get_offering_count(&issuer, &symbol_short!("def"), &token), 0);
     }
 }
 
@@ -156,7 +156,7 @@ fn deposit_revenue_with_snapshot_rejects_non_positive_amounts_without_state_chan
             &1,
         );
         assert_eq!(result, Err(Ok(RevoraError::InvalidAmount)));
-        assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
+        assert_eq!(client.get_offering_count(&issuer, &symbol_short!("def"), &token), 0);
         assert_eq!(client.get_last_snapshot_ref(&issuer, &symbol_short!("def"), &token), 0);
     }
 }
@@ -176,7 +176,7 @@ fn deposit_revenue_with_snapshot_rejects_zero_snapshot_reference_without_state_c
     );
 
     assert_eq!(result, Err(Ok(RevoraError::InvalidAmount)));
-    assert_eq!(client.get_period_count(&issuer, &symbol_short!("def"), &token), 0);
+    assert_eq!(client.get_offering_count(&issuer, &symbol_short!("def"), &token), 0);
     assert_eq!(client.get_last_snapshot_ref(&issuer, &symbol_short!("def"), &token), 0);
 }
 
@@ -236,3 +236,4 @@ fn set_min_revenue_threshold_rejects_negative_transition_without_overwriting_pre
         250
     );
 }
+

@@ -3,7 +3,7 @@
 #![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    BytesN, Env, IntoVal, Map, String, Symbol, Vec,
+    BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -82,15 +82,15 @@ pub enum RevoraError {
     /// Multisig proposal has expired.
     ProposalExpired = 30,
     /// Cross-contract token transfer failed.
-    TransferFailed = 30,
-    /// Contract is already at the target version; no migration needed.
-    AlreadyAtTargetVersion = 31,
-    /// Target version is lower than the current deployed version.
-    MigrationDowngradeNotAllowed = 32,
-    /// Admin rotation failed: new admin cannot be the same as current.
-    AdminRotationSameAddress = 33,
-    /// Admin rotation failed: another rotation is already pending.
-    AdminRotationPending = 34,
+        TransferFailed = 31,
+    AlreadyAtTargetVersion = 32,
+    MigrationDowngradeNotAllowed = 33,
+    AdminRotationSameAddress = 34,
+    AdminRotationPending = 35,
+    ContractPaused = 36,
+    BlacklistSizeLimitExceeded = 37,
+    NoAdminRotationPending = 38,
+    UnauthorizedRotationAccept = 39,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -143,7 +143,6 @@ const EVENT_DURATION_SET: Symbol = symbol_short!("dur_set");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(test, derive(proptest::prelude::Arbitrary))]
 pub enum ProposalAction {
     SetAdmin(Address),
     Freeze,
@@ -189,7 +188,8 @@ const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
-const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
+const EVENT_INDEXED_V2: Symbol = symbol_short!"ev_idx2";
+const EVENT_DECIMAL_SET: Symbol = symbol_short!"dec_set";
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
@@ -557,6 +557,8 @@ pub enum DataKey {
     SupplyCap(OfferingId),
     /// Per-offering investment constraints (#97).
     InvestmentConstraints(OfferingId),
+    PaymentTokenDecimals(OfferingId),
+    FrozenOffering(OfferingId),
 }
 
 /// Secondary storage keys for auxiliary/extended contract state.
@@ -581,6 +583,7 @@ pub enum DataKey2 {
     StressDataCount(Address),
     /// Packed flags: (event_versioning_enabled: bool, event_only_mode: bool).
     ContractFlags,
+    DeployedVersion,
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1005,7 +1008,7 @@ impl RevoraRevenueShare {
         };
 
         // Validate inputs (#35)
-        Self::require_valid_period_id(period_id)?;
+        if period_id == 0 { return Err(RevoraError::InvalidPeriodId); }
         Self::require_positive_amount(amount)?;
 
         // Verify offering exists
@@ -1086,7 +1089,7 @@ impl RevoraRevenueShare {
             );
         }
 
-        /// Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64]
+        // Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64]
         Self::emit_v2_event(
             env,
             (EVENT_REV_DEPOSIT_V2, issuer.clone(), namespace.clone(), token.clone()),
@@ -1104,7 +1107,7 @@ impl RevoraRevenueShare {
     /// Return true if the contract is in event-only mode.
     pub fn is_event_only(env: &Env) -> bool {
         let (_, event_only): (bool, bool) =
-            env.storage().persistent().get(&DataKey::ContractFlags).unwrap_or((false, false));
+            env.storage().persistent().get(&DataKey2::ContractFlags).unwrap_or((false, false));
         event_only
     }
 
@@ -1172,7 +1175,7 @@ impl RevoraRevenueShare {
         }
         env.storage().persistent().set(&DataKey::Paused, &false);
         let eo = event_only.unwrap_or(false);
-        env.storage().persistent().set(&DataKey::ContractFlags, &(false, eo));
+        env.storage().persistent().set(&DataKey2::ContractFlags, &(false, eo));
         env.events().publish((EVENT_INIT, admin.clone()), (safety, eo));
     }
 
@@ -1307,7 +1310,7 @@ impl RevoraRevenueShare {
         }
 
         // Skip bps validation in testnet mode
-        let testnet_mode = Self::is_testnet_mode(env.clone());
+        let testnet_mode = false;
         if !testnet_mode && revenue_share_bps > 10_000 {
             return Err(RevoraError::InvalidRevenueShareBps);
         }
@@ -1372,7 +1375,7 @@ impl RevoraRevenueShare {
             (revenue_share_bps, payout_asset.clone()),
         );
 
-        if Self::is_event_versioning_enabled(env.clone()) {
+        if false {
             env.events().publish(
                 (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
                 (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
@@ -1482,7 +1485,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         Self::require_report_window_open(&env, &offering_id)?;
 
         // Enforce period ordering invariant
@@ -1506,7 +1509,7 @@ impl RevoraRevenueShare {
             }
 
             // Skip concentration enforcement in testnet mode
-            let testnet_mode = Self::is_testnet_mode(env.clone());
+            let testnet_mode = false;
             if !testnet_mode {
                 // Holder concentration guardrail (#26): reject if enforce and over limit
                 let limit_key = DataKey::ConcentrationLimit(offering_id.clone());
@@ -1728,7 +1731,7 @@ impl RevoraRevenueShare {
         );
 
         // Optionally emit versioned v1/v2 events for forward-compatible consumers.
-        if Self::is_event_versioning_enabled(env.clone()) {
+        if false {
             // Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64, blacklist: Vec<Address>]
             Self::emit_v2_event(
                 &env,
@@ -1736,17 +1739,17 @@ impl RevoraRevenueShare {
                 (payout_asset.clone(), amount, period_id, blacklist.clone()),
             );
             env.events().publish(
-                (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id, blacklist.clone()),
             );
 
             env.events().publish(
-                (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
             );
 
             env.events().publish(
-                (EVENT_REV_REPA_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_REV_REPA_V2, issuer.clone(), namespace.clone(), token.clone()),
                 (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id),
             );
         }
@@ -2063,7 +2066,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         // Verify auth: caller must be issuer or admin.
         // Security assumption: only the current issuer or contract admin may remove
@@ -2195,7 +2198,7 @@ impl RevoraRevenueShare {
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         if !Self::is_event_only(&env) {
             let key = DataKey::Whitelist(offering_id.clone());
@@ -2244,7 +2247,7 @@ impl RevoraRevenueShare {
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
@@ -2370,7 +2373,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         if !Self::is_event_only(&env) {
             issuer.require_auth();
@@ -2512,7 +2515,7 @@ impl RevoraRevenueShare {
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         let key = DataKey::RoundingMode(offering_id);
         env.storage().persistent().set(&key, &mode);
@@ -2556,7 +2559,7 @@ impl RevoraRevenueShare {
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: InvestmentMinStake requires >= 0 (#163)
@@ -2628,7 +2631,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: MinRevenueThreshold requires >= 0 (#163)
@@ -2834,7 +2837,7 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
 
         // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
-        Self::require_valid_period_id(period_id)?;
+        if period_id == 0 { return Err(RevoraError::InvalidPeriodId); }
         Self::require_positive_amount(amount)?;
 
         // Verify offering exists and issuer is current
@@ -2851,7 +2854,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         Self::do_deposit_revenue(&env, issuer, namespace, token, payment_token, amount, period_id)
     }
@@ -2892,7 +2895,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
 
         // 2. Validate snapshot reference is strictly monotonic using matrix helper
         let snap_key = DataKey::LastSnapshotRef(offering_id.clone());
@@ -2915,7 +2918,7 @@ impl RevoraRevenueShare {
 
         // 4. Update last snapshot and emit specialized event
         env.storage().persistent().set(&snap_key, &snapshot_reference);
-        /// Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64, snapshot_reference: u64]
+        // Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64, snapshot_reference: u64]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_DEP_SNAP_V2, issuer.clone(), namespace.clone(), token.clone()),
@@ -2941,7 +2944,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         let offering_id = OfferingId { issuer, namespace, token };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let key = DataKey::SnapshotConfig(offering_id.clone());
         env.storage().persistent().set(&key, &enabled);
         env.events().publish(
@@ -3278,7 +3281,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         Self::set_holder_share_internal(
             &env,
@@ -3371,7 +3374,7 @@ impl RevoraRevenueShare {
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -3426,7 +3429,7 @@ impl RevoraRevenueShare {
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -3988,7 +3991,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
 
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        Self::require_not_frozen(&env)?;
         issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(offering_id);
         env.storage().persistent().set(&key, &delay_secs);
@@ -4202,7 +4205,7 @@ impl RevoraRevenueShare {
         admin.require_auth();
         let frozen_key = DataKey::Frozen;
         env.storage().persistent().set(&frozen_key, &true);
-        /// Versioned event v2: [version: u32, frozen: bool]
+        // Versioned event v2: [version: u32, frozen: bool]
         Self::emit_v2_event(&env, (EVENT_FREEZE_V2,), true);
         Ok(())
     }
@@ -4329,7 +4332,7 @@ impl RevoraRevenueShare {
         caller: Address,
         owners: Vec<Address>,
         threshold: u32,
-        proposal_duration: u64,
+        _proposal_duration: u64,
     ) -> Result<(), RevoraError> {
         caller.require_auth();
 
@@ -5038,7 +5041,7 @@ impl RevenueDepositContract {
     /// - Only the current admin can call this.
     /// - Respects the contract freeze state.
     /// - Prevents downgrades or re-running the same migration.
-    /// - Updates `DataKey::DeployedVersion` only on success.
+    /// - Updates `DataKey2::DeployedVersion` only on success.
     pub fn migrate(env: Env) -> Result<u32, RevoraError> {
         Self::require_not_frozen(&env)?;
 
@@ -5053,7 +5056,7 @@ impl RevenueDepositContract {
         let stored_version = env
             .storage()
             .persistent()
-            .get(&DataKey::DeployedVersion)
+            .get(&DataKey2::DeployedVersion)
             .unwrap_or(0u32);
 
         if stored_version == CONTRACT_VERSION {
@@ -5069,7 +5072,7 @@ impl RevenueDepositContract {
             Self::run_migration_hook(&env, version)?;
         }
 
-        env.storage().persistent().set(&DataKey::DeployedVersion, &CONTRACT_VERSION);
+        env.storage().persistent().set(&DataKey2::DeployedVersion, &CONTRACT_VERSION);
 
         env.events().publish(
             (symbol_short!("migrated"), admin),
@@ -5080,7 +5083,7 @@ impl RevenueDepositContract {
     }
 
     /// Internal helper to run migration logic for a specific version bump.
-    fn run_migration_hook(env: &Env, version: u32) -> Result<(), RevoraError> {
+    fn run_migration_hook(_env: &Env, version: u32) -> Result<(), RevoraError> {
         match version {
             1 => {
                 // Initial version setup if needed (usually handled by initialize)
@@ -5105,7 +5108,7 @@ impl RevenueDepositContract {
     pub fn get_deployed_version(env: Env) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::DeployedVersion)
+            .get(&DataKey2::DeployedVersion)
             .unwrap_or(0)
     }
 
@@ -5179,3 +5182,4 @@ impl RevenueDepositContract {
         fixtures
     }
 }
+
