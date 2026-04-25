@@ -7,7 +7,6 @@
 //! - Fee calculation is intentionally excluded from `InvalidAmount` rejection because the
 //!   current public fee surface in this branch is a pure quote helper, not a mutating entrypoint.
 
-#![cfg(test)]
 
 use crate::{InvestmentConstraintsConfig, RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{symbol_short, testutils::Address as _, token, Address, Env};
