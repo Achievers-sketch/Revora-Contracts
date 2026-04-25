@@ -188,8 +188,8 @@ const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
-const EVENT_INDEXED_V2: Symbol = symbol_short!"ev_idx2";
-const EVENT_DECIMAL_SET: Symbol = symbol_short!"dec_set";
+const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("dec_set");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
