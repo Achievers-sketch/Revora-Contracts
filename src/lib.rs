@@ -44,14 +44,24 @@ use soroban_sdk::{
 #[cfg(test)]
 mod test_duplicates;
 
+// ── Error code stability note (RC26Q2-C49) ───────────────────────────────────
+// Prior to v5, `ProposalExpired` and `TransferFailed` both carried discriminant 30.
+// `#[contracterror]` emits XDR spec entries per variant name; two names mapping to
+// the same wire value means off-chain decoders cannot distinguish them.
+// Fix: TransferFailed renumbered to 31. ProposalExpired remains 30.
+// Three variants missing from the enum but used in code are now added: 36–38.
+// See README.md error code table and src/structured_error_tests.rs for the full audit.
+
 /// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
+///
+/// Wire values are frozen — see README.md error code table for the full stability contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u32)]
 pub enum RevoraError {
     /// revenue_share_bps exceeded 10000 (100%).
     InvalidRevenueShareBps = 1,
-    /// Reserved for future use (e.g. offering limit per issuer).
+    /// Reserved / generic limit guard (e.g. offering limit per issuer, threshold out of range).
     LimitReached = 2,
     /// Holder concentration exceeds configured limit and enforcement is enabled.
     ConcentrationLimitExceeded = 3,
@@ -71,11 +81,9 @@ pub enum RevoraError {
     ContractFrozen = 10,
     /// Revenue for this period is not yet claimable (delay not elapsed).
     ClaimDelayNotElapsed = 11,
-
     /// Snapshot distribution is not enabled for this offering.
     SnapshotNotEnabled = 12,
     /// Provided snapshot reference is outdated or duplicates a previous one.
-    /// Overriding an existing revenue report.
     OutdatedSnapshot = 13,
     /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
@@ -94,9 +102,7 @@ pub enum RevoraError {
     /// Amount is invalid (e.g. negative for deposit, or out of allowed range) (#35).
     InvalidAmount = 21,
     /// period_id is invalid (e.g. zero when required to be positive) (#35).
-    /// period_id not strictly greater than previous (violates ordering invariant).
     InvalidPeriodId = 22,
-
     /// Deposit would exceed the offering's supply cap (#96).
     SupplyCapExceeded = 23,
     /// Metadata format is invalid for configured scheme rules.
@@ -112,6 +118,7 @@ pub enum RevoraError {
     /// Off-chain signer key has not been registered.
     SignerKeyNotRegistered = 29,
     /// Multisig proposal has expired.
+    /// Wire value: 30. Stable since v1.
     ProposalExpired = 30,
     /// Cross-contract token transfer failed.
     TransferFailed = 39,
