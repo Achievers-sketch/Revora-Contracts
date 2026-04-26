@@ -5242,6 +5242,43 @@ impl RevoraRevenueShare {
         env.storage().persistent().get::<DataKey, bool>(&DataKey::Frozen).unwrap_or(false)
     }
 
+    /// Enable or disable testnet mode. When enabled, certain validations are relaxed for testnet deployments.
+    /// 
+    /// **SECURITY WARNING:** Testnet mode relaxes critical validations that protect investor funds.
+    /// This mode should NEVER be enabled on production/mainnet deployments. Integrators must
+    /// verify `is_testnet_mode()` returns `false` before considering the contract production-ready.
+    /// 
+    /// When enabled, the following validations are skipped:
+    /// - `register_offering`: revenue_share_bps > 10000 allowed
+    /// - `report_revenue`: concentration enforcement bypassed
+    /// 
+    /// Only the contract admin can toggle this mode. Changes emit a `test_mode` event.
+    /// 
+    /// # Arguments
+    /// * `enabled` - true to enable testnet mode, false to disable
+    /// 
+    /// # Errors
+    /// * `NotInitialized` - if admin is not set
+    /// * `ContractFrozen` - if contract is frozen
+    pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage().persistent().set(&DataKey::TestnetMode, &enabled);
+        env.events().publish((EVENT_TESTNET_MODE, admin), enabled);
+        Ok(())
+    }
+
+    /// Return true if testnet mode is enabled.
+    /// 
+    /// **INTEGRATOR CHECK:** Always verify this returns `false` for production deployments.
+    /// Testnet mode relaxes validations that could lead to fund loss if enabled accidentally.
+    pub fn is_testnet_mode(env: Env) -> bool {
+        env.storage().persistent().get::<DataKey, bool>(&DataKey::TestnetMode).unwrap_or(false)
+    }
+
     // ── Multisig admin logic ───────────────────────────────────
 
     pub const MAX_MULTISIG_OWNERS: u32 = 20;

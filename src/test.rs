@@ -3921,6 +3921,52 @@ fn set_testnet_mode_emits_event() {
 }
 
 #[test]
+fn testnet_mode_functions_properly_implemented() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let admin = Address::generate(&env);
+
+    // Initially disabled
+    assert!(!client.is_testnet_mode());
+
+    // Set admin
+    client.set_admin(&admin);
+
+    // Enable testnet mode
+    client.set_testnet_mode(&true);
+    assert!(client.is_testnet_mode());
+
+    // Disable testnet mode
+    client.set_testnet_mode(&false);
+    assert!(!client.is_testnet_mode());
+}
+
+#[test]
+fn testnet_mode_toggle_emits_correct_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+
+    // Enable
+    client.set_testnet_mode(&true);
+    let events = legacy_events(&env);
+    let last_event = &events[events.len() - 1];
+    assert_eq!(last_event.0, symbol_short!("test_mode"));
+    assert_eq!(last_event.1.get(1).unwrap(), true.into());
+
+    // Disable
+    client.set_testnet_mode(&false);
+    let events = legacy_events(&env);
+    let last_event = &events[events.len() - 1];
+    assert_eq!(last_event.0, symbol_short!("test_mode"));
+    assert_eq!(last_event.1.get(1).unwrap(), false.into());
+}
+
+#[test]
 fn issuer_transfer_accept_completes_transfer() {
     let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
     let new_issuer = Address::generate(&env);

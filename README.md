@@ -2,6 +2,17 @@
 
 Soroban contract for revenue-share offerings and blacklist management.
 
+## 🚨 CRITICAL SECURITY WARNING
+
+**TESTNET MODE DANGER:** This contract includes a "testnet mode" that relaxes critical validations for development/testing. **NEVER enable testnet mode on production/mainnet deployments.** 
+
+- **Check before use:** Always call `is_testnet_mode()` and verify it returns `false` for production contracts.
+- **Admin responsibility:** Only enable testnet mode during development/testing phases.
+- **Relaxed validations:** When enabled, allows `revenue_share_bps > 10000` and bypasses concentration enforcement, potentially leading to fund loss.
+- **Audit requirement:** Production deployments must be verified to have testnet mode disabled.
+
+**If `is_testnet_mode()` returns `true` on a production contract, DO NOT USE IT - funds may be at risk.**
+
 ## Contract interface summary (for integrators)
 
 *- **Issuer authority:** Only the offering issuer can register offerings, report revenue, set concentration limits, set rounding mode, and report concentration for that offering. The contract does not implement a separate "platform admin" role; all offering-level actions are issuer-authorized.
