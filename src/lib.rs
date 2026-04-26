@@ -228,6 +228,7 @@ const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("dec_set");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
@@ -560,6 +561,8 @@ pub enum DataKey {
     LastClaimedIdx(OfferingId, Address),
     /// Payment token address for an offering.
     PaymentToken(OfferingId),
+    /// Cached payment token decimals for offering compatibility checks.
+    PaymentTokenDecimals(OfferingId),
     /// Per-offering claim delay in seconds (#27). 0 = immediate claim.
     ClaimDelaySecs(OfferingId),
     /// Ledger timestamp when revenue was deposited for (offering_id, period_id).
@@ -568,6 +571,8 @@ pub enum DataKey {
     Admin,
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
+    /// Offering-level frozen flag; when true, offering mutations are disabled.
+    FrozenOffering(OfferingId),
     /// Proposed new admin address (pending two-step rotation).
     PendingAdmin,
 
@@ -607,6 +612,8 @@ pub enum DataKey {
 
     /// Configuration flag: when true, contract is event-only (no persistent business state).
     EventOnlyMode,
+    /// Last migrated storage version for upgrade hooks.
+    DeployedVersion,
 
     /// Metadata reference for an offering.
     OfferingMetadata(OfferingId),
@@ -5144,6 +5151,9 @@ impl RevoraRevenueShare {
         if threshold == 0 || threshold > owners.len() {
             return Err(RevoraError::LimitReached); // Improper threshold
         }
+        if proposal_duration == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
 
         // Check for duplicate owners
         for i in 0..owners.len() {
@@ -5234,7 +5244,7 @@ impl RevoraRevenueShare {
         // Check for duplicate approvals
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == approver {
-                return Ok(()); // Already approved
+                return Err(RevoraError::AlreadyApproved);
             }
         }
 
@@ -5300,7 +5310,6 @@ impl RevoraRevenueShare {
                 env.storage().persistent().set(&DataKey::Admin, &new_admin);
             }
             ProposalAction::Freeze => {
-                Self::require_not_frozen(&env)?;
                 env.storage().persistent().set(&DataKey::Frozen, &true);
                 env.events().publish((EVENT_FREEZE, proposal.proposer.clone()), true);
             }
@@ -5324,8 +5333,8 @@ impl RevoraRevenueShare {
                 owners.push_back(new_owner);
                 env.storage().persistent().set(&DataKey::MultisigOwners, &owners);
             }
-            ProposalAction::RemoveOwner(addr) => {
-                let mut owners: Vec<Address> =
+            ProposalAction::RemoveOwner(old_owner) => {
+                let owners: Vec<Address> =
                     env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
                 if !owners.contains(&addr) {
                     return Err(RevoraError::NotAuthorized);
@@ -5337,7 +5346,7 @@ impl RevoraRevenueShare {
                 let mut new_owners = Vec::new(&env);
                 for i in 0..owners.len() {
                     let owner = owners.get(i).unwrap();
-                    if owner != addr {
+                    if owner != old_owner {
                         new_owners.push_back(owner);
                     }
                 }
