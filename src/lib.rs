@@ -245,6 +245,13 @@ const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 /// Emitted when `repair_audit_summary` writes a corrected `AuditSummary` to storage.
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
 
+/// Missing v1 event symbols (referenced by report_revenue versioned path).
+const EVENT_REV_INIA_V1: Symbol = symbol_short!("rv_inia1");
+const EVENT_REV_REP_V1: Symbol = symbol_short!("rv_rep1");
+const EVENT_REV_REPA_V1: Symbol = symbol_short!("rv_repa1");
+/// Emitted when payment token decimals are set for an offering.
+const EVENT_DECIMAL_SET: Symbol = symbol_short!("dec_set");
+
 /// Current schema for `EVENT_INDEXED_V2` topics.
 const INDEXER_EVENT_SCHEMA_VERSION: u32 = 2;
 
@@ -4643,6 +4650,172 @@ impl RevoraRevenueShare {
             payouts.push_back((holder.clone(), payout));
         }
         SimulateDistributionResult { total_distributed: total, payouts }
+    }
+
+    // ── Issuer two-step transfer (#258) ──────────────────────────
+
+    /// Propose transferring issuer control of an offering to a new address.
+    ///
+    /// First step of the two-step transfer flow. The current issuer proposes; the new
+    /// issuer must call `accept_issuer_transfer` to complete. Only one transfer may be
+    /// pending per offering at a time.
+    ///
+    /// Emits `iss_prop` event: topics `(iss_prop, token)`, data `(current_issuer, new_issuer)`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — no offering for `(issuer, namespace, token)`, or caller is not current issuer.
+    /// - `IssuerTransferPending` — a transfer is already pending; cancel it first.
+    /// - `ContractFrozen` — contract is frozen.
+    pub fn propose_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        new_issuer: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        let offering_id =
+            OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+
+        // Verify offering exists and caller is current issuer
+        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // Reject if a transfer is already pending
+        let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
+        if env.storage().persistent().has(&pending_key) {
+            return Err(RevoraError::IssuerTransferPending);
+        }
+
+        env.storage().persistent().set(&pending_key, &new_issuer);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_PROPOSED, token.clone()),
+            (issuer.clone(), new_issuer.clone()),
+        );
+
+        Ok(())
+    }
+
+    /// Accept a pending issuer transfer. Must be called by the proposed new issuer.
+    ///
+    /// Completes the transfer: updates the offering's `issuer` field and the reverse-lookup,
+    /// then clears the pending record.
+    ///
+    /// Emits `iss_acc` event: topics `(iss_acc, token)`, data `(old_issuer, new_issuer)`.
+    ///
+    /// ### Errors
+    /// - `NoTransferPending` — no transfer is pending for this offering.
+    /// - `ContractFrozen` — contract is frozen.
+    /// - Auth panic if caller is not the proposed new issuer.
+    pub fn accept_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        let offering_id =
+            OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
+
+        let new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        // New issuer must authorize
+        new_issuer.require_auth();
+
+        // Update the offering record in-place (it stays under old issuer's tenant slot)
+        let tenant_id = TenantId { issuer: issuer.clone(), namespace: namespace.clone() };
+        let count = Self::get_offering_count(env.clone(), issuer.clone(), namespace.clone());
+        for i in 0..count {
+            let item_key = DataKey::OfferItem(tenant_id.clone(), i);
+            let mut offering: Offering = env.storage().persistent().get(&item_key).unwrap();
+            if offering.token == token {
+                offering.issuer = new_issuer.clone();
+                env.storage().persistent().set(&item_key, &offering);
+                break;
+            }
+        }
+
+        // Update reverse-lookup so future auth checks resolve to new issuer
+        let issuer_lookup_key = DataKey::OfferingIssuer(offering_id.clone());
+        env.storage().persistent().set(&issuer_lookup_key, &new_issuer);
+
+        // Clear pending record
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_ACCEPTED, token.clone()),
+            (issuer.clone(), new_issuer.clone()),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending issuer transfer. Must be called by the current issuer.
+    ///
+    /// Emits `iss_canc` event: topics `(iss_canc, token)`, data `(current_issuer, proposed_new_issuer)`.
+    ///
+    /// ### Errors
+    /// - `NoTransferPending` — no transfer is pending for this offering.
+    /// - `OfferingNotFound` — caller is not the current issuer.
+    /// - `ContractFrozen` — contract is frozen.
+    pub fn cancel_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        let offering_id =
+            OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+
+        // Verify caller is current issuer
+        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
+        let proposed_new_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RevoraError::NoTransferPending)?;
+
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (EVENT_ISSUER_TRANSFER_CANCELLED, token.clone()),
+            (issuer.clone(), proposed_new_issuer.clone()),
+        );
+
+        Ok(())
+    }
+
+    /// Return the proposed new issuer for a pending transfer, if any.
+    pub fn get_pending_issuer_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<Address> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let pending_key = DataKey::PendingIssuerTransfer(offering_id);
+        env.storage().persistent().get(&pending_key)
     }
 
     // ── Upgradeability guard and freeze (#32) ───────────────────
