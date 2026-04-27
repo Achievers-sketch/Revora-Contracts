@@ -46,10 +46,23 @@ pub enum VestingDataKey {
     ClaimRecord(Address, u32, u32),
 }
 
+// Legacy event symbols (for backward compatibility)
 const EVENT_VESTING_CREATED: Symbol = symbol_short!("vest_crt");
 const EVENT_VESTING_CLAIMED: Symbol = symbol_short!("vest_clm");
 const EVENT_VESTING_CANCELLED: Symbol = symbol_short!("vest_can");
 const EVENT_VESTING_AMENDED: Symbol = symbol_short!("vest_amd");
+
+// Versioned event symbols (v1 schema)
+const EVENT_VESTING_CREATED_V1: Symbol = symbol_short!("vst_crt1");
+const EVENT_VESTING_CLAIMED_V1: Symbol = symbol_short!("vst_clm1");
+const EVENT_VESTING_CANCELLED_V1: Symbol = symbol_short!("vst_can1");
+const EVENT_VESTING_AMENDED_V1: Symbol = symbol_short!("vst_amd1");
+
+// Partial claim event
+const EVENT_VESTING_PCLAIM: Symbol = symbol_short!("vest_pcl");
+
+// Event schema version
+pub const VESTING_EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[contract]
 pub struct RevoraVesting;
@@ -248,8 +261,12 @@ impl RevoraVesting {
         env.storage().persistent().set(&key, &schedule);
 
         env.events().publish(
-            (EVENT_VESTING_AMENDED, admin, beneficiary),
+            (EVENT_VESTING_AMENDED, admin.clone(), beneficiary.clone()),
             (schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
+        );
+        env.events().publish(
+            (EVENT_VESTING_AMENDED_V1, admin, beneficiary),
+            (VESTING_EVENT_SCHEMA_VERSION, schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
         );
 
         Ok(())
