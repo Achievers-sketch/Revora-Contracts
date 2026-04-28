@@ -7,6 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
 
+/// Errors produced by the vesting module.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -21,6 +22,21 @@ pub enum VestingError {
     InvalidCliff = 8,
     AmendmentNotAllowed = 9,
 }
+
+
+/// A single vesting tranche for a beneficiary.
+///
+/// # Fields
+/// * `beneficiary`  – Recipient of vested tokens.
+/// * `token`        – SEP-41 token contract address.
+/// * `total_amount` – Total tokens to vest (must be > 0).
+/// * `cliff_time`     – Unix timestamp before which *nothing* unlocks.
+/// * `start_time`     – Vesting start for linear portion (must be ≥ `cliff_time`).
+/// * `end_time`       – Full-vest timestamp (must be > `start_time`).
+///
+/// Tokens vest linearly from `start_time` to `end_time`.  Between `cliff_time`
+/// and `start_time` the vested amount is 0 (pure cliff).  After `end_time`
+/// the full `total_amount` is vested.
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]

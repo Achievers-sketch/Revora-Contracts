@@ -5696,155 +5696,6 @@ impl RevoraRevenueShare {
 }
 
 // ─── Revenue Deposit Contract (secondary contract) ───────────────────────────
-pub mod revenue_deposit {
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    token::Client as TokenClient,
-};
-use crate::{
-    DataKey as RevoraDataKey, RevoraError, EventIndexTopicV2,
-    EVENT_TYPE_OFFER, EVENT_TYPE_REV_INIT, EVENT_TYPE_REV_OVR, EVENT_TYPE_REV_REJ,
-    EVENT_TYPE_REV_REP, EVENT_TYPE_CLAIM, BPS_DENOMINATOR, CONTRACT_VERSION,
-};
-
-        env.events().publish((EVENT_PROPOSAL_EXECUTED, executor), proposal_id);
-        Ok(())
-    }
-
-    pub fn calculate_fee_for_asset(
-        _env: Env,
-        _issuer: Address,
-        _namespace: Symbol,
-        _token: Address,
-        _asset: Address,
-        _amount: i128,
-    ) -> i128 {
-        0i128
-    }
-
-            let stored_version =
-                env.storage().persistent().get(&DataKey::DeployedVersion).unwrap_or(0u32);
-
-            if stored_version == CONTRACT_VERSION {
-                return Err(RevoraError::AlreadyAtTargetVersion);
-            }
-
-            if stored_version > CONTRACT_VERSION {
-                return Err(RevoraError::MigrationDowngradeNotAllowed);
-            }
-
-            // Run migration hooks sequentially
-            for version in (stored_version + 1)..=CONTRACT_VERSION {
-                Self::run_migration_hook(&env, version)?;
-            }
-
-            env.storage().persistent().set(&DataKey::DeployedVersion, &CONTRACT_VERSION);
-
-            env.events()
-                .publish((symbol_short!("migrated"), admin), (stored_version, CONTRACT_VERSION));
-
-            Ok(CONTRACT_VERSION)
-        }
-
-        /// Internal helper to run migration logic for a specific version bump.
-        fn run_migration_hook(env: &Env, version: u32) -> Result<(), RevoraError> {
-            match version {
-                1 => {
-                    // Initial version setup if needed (usually handled by initialize)
-                }
-                2 => {
-                    // Example v2 migration logic
-                }
-                3 => {
-                    // Example v3 migration logic
-                }
-                4 => {
-                    // Example v4 migration logic
-                }
-                _ => {
-                    // Future versions will be handled here
-                }
-            }
-            Ok(())
-        }
-
-        /// Return the current deployed version of the contract state.
-        pub fn get_deployed_version(env: Env) -> u32 {
-            env.storage().persistent().get(&DataKey::DeployedVersion).unwrap_or(0)
-        }
-
-        /// Return the current contract version (#23). Used for upgrade compatibility and migration.
-        pub fn get_version(env: Env) -> u32 {
-            let _ = env;
-            CONTRACT_VERSION
-        }
-
-        /// Deterministic fixture payloads for indexer integration tests (#187).
-        ///
-        /// Returns canonical v2 indexed topics in a stable order so indexers can
-        /// validate decoding, routing and storage schemas without replaying full
-        /// contract flows.
-        pub fn get_indexer_fixture_topics(
-            env: Env,
-            issuer: Address,
-            namespace: Symbol,
-            token: Address,
-            period_id: u64,
-        ) -> Vec<EventIndexTopicV2> {
-            let mut fixtures = Vec::new(&env);
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_OFFER,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id: 0,
-            });
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_REV_INIT,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id,
-            });
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_REV_OVR,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id,
-            });
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_REV_REJ,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id,
-            });
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_REV_REP,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id,
-            });
-            fixtures.push_back(EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_CLAIM,
-                issuer,
-                namespace,
-                token,
-                period_id: 0,
-            });
-            fixtures
-        }
-    }
-}
-
     /// Deterministic fixture payloads for indexer integration tests (#187).
     ///
     /// Returns canonical v2 indexed topics in a stable order so indexers can
@@ -5988,8 +5839,10 @@ use crate::{
         });
         fixtures
     }
-}
 
+// ── Test modules ─────────────────────────────────────────────────────────────
+
+// close impl RevoraRevenueShare
 
 // ── Test modules ─────────────────────────────────────────────────────────────
 // Each file uses `use crate::...` and `#![cfg(test)]` so they are only compiled
