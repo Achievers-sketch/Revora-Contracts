@@ -8756,3 +8756,268 @@ mod admin_rotation_regression {
         assert_eq!(result, Err(Ok(RevoraError::ContractFrozen)));
     }
 }
+
+// ── Share-sum adversarial tests (#299) ────────────────────────────────────────
+//
+// These tests document and verify the actual on-chain invariants for
+// set_holder_share and the payout arithmetic in claim():
+//
+//   1. Per-holder cap: share_bps ∈ [0, 10_000] is always enforced.
+//   2. No aggregate cap: the contract does NOT track the sum across holders.
+//   3. Over-allocation (sum > 10_000 bps) causes TransferFailed at claim time
+//      because the contract tries to transfer more tokens than it holds.
+//   4. Exact allocation (sum = 10_000 bps) distributes the full deposit.
+//   5. Under-allocation (sum < 10_000 bps) leaves the remainder in the contract.
+//
+// See docs/share-sum-invariant-checks.md for the full security / risk analysis.
+
+#[test]
+fn share_bps_per_holder_cap_enforced() {
+    let (env, client, issuer, token, _pt, _cid) = claim_setup();
+    let holder = Address::generate(&env);
+    let result =
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_001);
+    assert_eq!(result, Err(Ok(RevoraError::InvalidShareBps)));
+}
+
+#[test]
+fn share_bps_exactly_10000_accepted() {
+    let (env, client, issuer, token, _pt, _cid) = claim_setup();
+    let holder = Address::generate(&env);
+    client
+        .try_set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000)
+        .unwrap();
+    assert_eq!(
+        client.get_holder_share(&issuer, &symbol_short!("def"), &token, &holder),
+        10_000
+    );
+}
+
+/// Over-allocation: two holders each at 6 000 bps (sum = 12 000 > 10 000).
+/// The contract accepts both writes (no aggregate check), but when the second
+/// holder claims, the contract has already paid out 60 % to the first holder
+/// and only 40 % remains — the second holder's 60 % claim exceeds the balance,
+/// so the token transfer fails with TransferFailed.
+#[test]
+fn multi_holder_over_allocation_transfer_fails() {
+    let (env, client, issuer, token, payment_token, contract_id) = claim_setup();
+    let holder_a = Address::generate(&env);
+    let holder_b = Address::generate(&env);
+
+    // Both set to 6 000 bps — sum = 12 000, over the 10 000 ceiling.
+    // The contract accepts both writes (per-holder cap only).
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &6_000);
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_b, &6_000);
+
+    // Deposit 100 000 tokens.
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+    assert_eq!(balance(&env, &payment_token, &contract_id), 100_000);
+
+    // Holder A claims 60 % = 60 000. Succeeds; contract now holds 40 000.
+    let payout_a = client.claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(payout_a, 60_000);
+    assert_eq!(balance(&env, &payment_token, &contract_id), 40_000);
+
+    // Holder B tries to claim 60 % = 60 000, but only 40 000 remain.
+    // The token transfer must fail.
+    let result = client.try_claim(&holder_b, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(result, Err(Ok(RevoraError::TransferFailed)));
+    // Contract balance is unchanged after the failed claim.
+    assert_eq!(balance(&env, &payment_token, &contract_id), 40_000);
+}
+
+/// Exact allocation: two holders at 5 000 bps each (sum = 10 000).
+/// Both claims succeed and together they receive exactly the deposited amount.
+#[test]
+fn multi_holder_exact_10000_sum_pays_correctly() {
+    let (env, client, issuer, token, payment_token, contract_id) = claim_setup();
+    let holder_a = Address::generate(&env);
+    let holder_b = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &5_000);
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_b, &5_000);
+
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+
+    let payout_a = client.claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0);
+    let payout_b = client.claim(&holder_b, &issuer, &symbol_short!("def"), &token, &0);
+
+    assert_eq!(payout_a, 50_000);
+    assert_eq!(payout_b, 50_000);
+    assert_eq!(payout_a + payout_b, 100_000);
+    // Contract is fully drained.
+    assert_eq!(balance(&env, &payment_token, &contract_id), 0);
+}
+
+/// Under-allocation: two holders at 3 000 bps each (sum = 6 000 < 10 000).
+/// Both claims succeed; 40 % of the deposit remains in the contract.
+#[test]
+fn multi_holder_under_allocation_pays_partial() {
+    let (env, client, issuer, token, payment_token, contract_id) = claim_setup();
+    let holder_a = Address::generate(&env);
+    let holder_b = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &3_000);
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_b, &3_000);
+
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+
+    let payout_a = client.claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0);
+    let payout_b = client.claim(&holder_b, &issuer, &symbol_short!("def"), &token, &0);
+
+    assert_eq!(payout_a, 30_000);
+    assert_eq!(payout_b, 30_000);
+    // 40 000 remains in the contract (unallocated).
+    assert_eq!(balance(&env, &payment_token, &contract_id), 40_000);
+}
+
+/// Adversarial: many holders each at max bps (10 000).
+/// The contract accepts all writes. The first holder drains the contract;
+/// all subsequent holders get TransferFailed.
+#[test]
+fn adversarial_many_holders_max_bps_each() {
+    let (env, client, issuer, token, payment_token, contract_id) = claim_setup();
+
+    let holders: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for h in &holders {
+        client.set_holder_share(&issuer, &symbol_short!("def"), &token, h, &10_000);
+    }
+
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+
+    // First holder claims 100 % = 100 000. Succeeds.
+    let payout_first = client.claim(&holders[0], &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(payout_first, 100_000);
+    assert_eq!(balance(&env, &payment_token, &contract_id), 0);
+
+    // All remaining holders fail because the contract is empty.
+    for h in holders.iter().skip(1) {
+        let result = client.try_claim(h, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(result, Err(Ok(RevoraError::TransferFailed)));
+    }
+}
+
+/// RoundHalfUp across multiple holders: even with rounding up, no single
+/// holder's payout exceeds the deposited amount (per-holder bounds hold).
+#[test]
+fn multi_holder_roundhalfup_per_holder_payout_bounded() {
+    let (env, client, issuer, token, payment_token, _cid) = claim_setup();
+    let deposit = 10_001_i128;
+
+    // Three holders with bps that trigger rounding: 3 333 + 3 333 + 3 334 = 10 000
+    let bps_set: &[u32] = &[3_333, 3_333, 3_334];
+    let holders: Vec<Address> = bps_set.iter().map(|_| Address::generate(&env)).collect();
+
+    for (h, &bps) in holders.iter().zip(bps_set.iter()) {
+        client.set_holder_share(&issuer, &symbol_short!("def"), &token, h, &bps);
+    }
+
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &deposit,
+        &1,
+    );
+
+    let mut total_paid: i128 = 0;
+    for h in &holders {
+        let payout = client.claim(h, &issuer, &symbol_short!("def"), &token, &0);
+        assert!(payout >= 0, "payout must be non-negative");
+        assert!(payout <= deposit, "single holder payout must not exceed deposit");
+        total_paid += payout;
+    }
+    // Total paid must not exceed the deposit.
+    assert!(
+        total_paid <= deposit,
+        "total paid {total_paid} exceeds deposit {deposit}"
+    );
+}
+
+/// Holder with 0 bps cannot claim (NoPendingClaims).
+#[test]
+fn share_bps_zero_holder_gets_no_payout() {
+    let (env, client, issuer, token, payment_token, _cid) = claim_setup();
+    let holder = Address::generate(&env);
+
+    // Explicitly set to 0 (or never set — both result in 0).
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &0);
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+
+    let result = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(result, Err(Ok(RevoraError::NoPendingClaims)));
+}
+
+/// Updating a holder's share to 0 stops future payouts for that holder.
+#[test]
+fn share_bps_update_to_zero_removes_payout() {
+    let (env, client, issuer, token, payment_token, _cid) = claim_setup();
+    let holder = Address::generate(&env);
+
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &5_000);
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &1,
+    );
+
+    // Claim period 1 at 50 %.
+    let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(p1, 50_000);
+
+    // Issuer removes the holder's share.
+    client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &0);
+
+    // Deposit a second period.
+    client.deposit_revenue(
+        &issuer,
+        &symbol_short!("def"),
+        &token,
+        &payment_token,
+        &100_000,
+        &2,
+    );
+
+    // Holder now has 0 bps — claim must fail.
+    let result = client.try_claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+    assert_eq!(result, Err(Ok(RevoraError::NoPendingClaims)));
+}
