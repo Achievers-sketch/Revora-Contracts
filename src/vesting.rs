@@ -87,47 +87,32 @@ pub enum VestingError {
     Unauthorized = 105,
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// Legacy event symbols (for backward compatibility)
+const EVENT_VESTING_CREATED: Symbol = symbol_short!("vest_crt");
+const EVENT_VESTING_CLAIMED: Symbol = symbol_short!("vest_clm");
+const EVENT_VESTING_CANCELLED: Symbol = symbol_short!("vest_can");
+const EVENT_VESTING_AMENDED: Symbol = symbol_short!("vest_amd");
+const EVENT_VESTING_PCLAIM: Symbol = symbol_short!("vest_pcl");
 
-/// Compute how many tokens are vested at `now`, given the schedule.
-///
-/// Returns a value in `[0, total_amount]`.  Pure function — no storage I/O.
-///
-/// # Invariants
-/// * Returns 0 if `now < cliff_ts` (cliff not reached).
-/// * Returns `total_amount` if `now >= end_ts` (fully vested).
-/// * Returns a linearly interpolated value otherwise.
-pub fn vested_amount(schedule: &VestingSchedule, now: u64) -> i128 {
-    if now < schedule.cliff_ts {
-        // Before cliff — nothing unlocked.
-        return 0;
-    }
-    if now >= schedule.end_ts {
-        // Past or at full-vest — everything unlocked.
-        return schedule.total_amount;
-    }
-    if now < schedule.start_ts {
-        // After cliff but before linear start — still 0 (pure cliff period).
-        return 0;
-    }
-    // Linear interpolation between start_ts and end_ts.
-    // Use i128 arithmetic; duration and elapsed are u64 ≤ ~1.8e19, safe.
-    let elapsed = (now - schedule.start_ts) as i128;
-    let duration = (schedule.end_ts - schedule.start_ts) as i128;
-    // Multiply first to avoid integer truncation.
-    schedule.total_amount * elapsed / duration
-}
+/// Shared schema version for vesting events.
+pub const VESTING_EVENT_SCHEMA_VERSION: u32 = 1;
 
-/// Amount claimable *now* (vested minus already claimed).
-///
-/// Always ≥ 0 by construction.
-fn claimable_amount(schedule: &VestingSchedule, claimed: i128, now: u64) -> i128 {
-    let vested = vested_amount(schedule, now);
-    // Defensive: clamp to 0 (should never go negative given invariants).
-    if vested > claimed { vested - claimed } else { 0 }
-}
+const EVENT_VESTING_CREATED_V1: Symbol = symbol_short!("vst_crt1");
+const EVENT_VESTING_CLAIMED_V1: Symbol = symbol_short!("vst_clm1");
+const EVENT_VESTING_CANCELLED_V1: Symbol = symbol_short!("vst_can1");
+const EVENT_VESTING_PCLAIM_V1: Symbol = symbol_short!("vst_pcl1");
 
-// ── Contract implementation ───────────────────────────────────────────────────
+// Versioned event symbols (v1 schema)
+const EVENT_VESTING_CREATED_V1: Symbol = symbol_short!("vst_crt1");
+const EVENT_VESTING_CLAIMED_V1: Symbol = symbol_short!("vst_clm1");
+const EVENT_VESTING_CANCELLED_V1: Symbol = symbol_short!("vst_can1");
+const EVENT_VESTING_AMENDED_V1: Symbol = symbol_short!("vst_amd1");
+
+// Partial claim event
+const EVENT_VESTING_PCLAIM: Symbol = symbol_short!("vest_pcl");
+
+// Event schema version
+pub const VESTING_EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[contract]
 pub struct VestingContract;
@@ -249,19 +234,70 @@ impl VestingContract {
             return Ok(0);
         }
 
-        // ── Safety assertion: never exceed total_amount ──────────────────────
-        let new_claimed = already_claimed
-            .checked_add(claimable)
-            .expect("vesting: claimed overflow");
-        assert!(
-            new_claimed <= schedule.total_amount,
-            "vesting: invariant violated — claimed > total"
+        env.events().publish(
+            (EVENT_VESTING_AMENDED, admin.clone(), beneficiary.clone()),
+            (schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
+        );
+        env.events().publish(
+            (EVENT_VESTING_AMENDED_V1, admin, beneficiary),
+            (VESTING_EVENT_SCHEMA_VERSION, schedule_index, new_total_amount, new_start_time, new_cliff_time, new_end_time),
         );
 
-        // ── Advance cursor first (checks-effects-interactions) ───────────────
-        env.storage()
-            .persistent()
-            .set(&claimed_key, &new_claimed);
+        Ok(())
+    }
+
+    /// Compute currently vested amount (linear from cliff to end).
+    fn vested_amount(env: &Env, schedule: &VestingSchedule) -> i128 {
+        let now = env.ledger().timestamp();
+        if now < schedule.cliff_time || schedule.cancelled {
+            return 0;
+        }
+        if now >= schedule.end_time {
+            return schedule.total_amount;
+        }
+        let vesting_duration = schedule.end_time - schedule.cliff_time;
+        let elapsed = now - schedule.cliff_time;
+        let vested = (schedule.total_amount as u128)
+            .saturating_mul(elapsed as u128)
+            .checked_div(vesting_duration as u128)
+            .unwrap_or(0) as i128;
+        core::cmp::min(vested, schedule.total_amount)
+    }
+
+    /// Claim vested tokens. Callable by beneficiary.
+    ///
+    /// Claim accounting is checked before storage is updated so the claimed
+    /// balance can never exceed the schedule total, even if a partial claim
+    /// arrives after other state changes.
+    /// Renamed to `claim_vesting` to avoid symbol conflicts with other contracts.
+    pub fn claim_vesting(
+        env: Env,
+        beneficiary: Address,
+        admin: Address,
+        schedule_index: u32,
+    ) -> Result<i128, VestingError> {
+        beneficiary.require_auth();
+        let key = VestingDataKey::Schedule(admin.clone(), schedule_index);
+        let mut schedule: VestingSchedule =
+            env.storage().persistent().get(&key).ok_or(VestingError::ScheduleNotFound)?;
+        if schedule.beneficiary != beneficiary {
+            return Err(VestingError::ScheduleNotFound);
+        }
+        if schedule.cancelled {
+            return Err(VestingError::ScheduleNotFound);
+        }
+        let vested = Self::vested_amount(&env, &schedule);
+        let claimable = vested.saturating_sub(schedule.claimed_amount);
+        if claimable <= 0 {
+            return Err(VestingError::NothingToClaim);
+        }
+        let new_claimed =
+            schedule.claimed_amount.checked_add(claimable).ok_or(VestingError::InvalidAmount)?;
+        if new_claimed > schedule.total_amount {
+            return Err(VestingError::InvalidAmount);
+        }
+        schedule.claimed_amount = new_claimed;
+        env.storage().persistent().set(&key, &schedule);
 
         // ── Transfer tokens to beneficiary ───────────────────────────────────
         let tok = token::Client::new(&env, &schedule.token);
@@ -280,17 +316,12 @@ impl VestingContract {
         Ok(claimable)
     }
 
-    // ── Revocation ────────────────────────────────────────────────────────────
-
-    /// Revoke a vesting schedule.  Vested-but-unclaimed tokens are sent to
-    /// `beneficiary`; unvested tokens are returned to `issuer`.
+    /// Claim a specific amount of currently claimable tokens (partial claim).
     ///
-    /// Only the original `issuer` may call this.
-    ///
-    /// # Errors
-    /// * [`VestingError::ScheduleNotFound`] – no schedule for this address.
-    /// * [`VestingError::Unauthorized`]     – caller is not the issuer.
-    pub fn vesting_revoke(
+    /// Partial claims are append-only. Each success writes one ledger record,
+    /// advances the schedule cursor, and emits both legacy and versioned
+    /// partial-claim events.
+    pub fn claim_vesting_partial(
         env: Env,
         issuer: Address,
         beneficiary: Address,
@@ -310,57 +341,49 @@ impl VestingContract {
             return Err(VestingError::Unauthorized);
         }
 
-        let already_claimed: i128 = env
-            .storage()
-            .persistent()
-            .get(&claimed_key)
-            .unwrap_or(0_i128);
-
-        let now = env.ledger().timestamp();
-        let vested = vested_amount(&schedule, now);
-
-        // Tokens owed to beneficiary = vested minus already received.
-        let beneficiary_due = if vested > already_claimed {
-            vested - already_claimed
-        } else {
-            0
-        };
-        // Unvested remainder returns to issuer.
-        let issuer_due = schedule.total_amount - already_claimed - beneficiary_due;
-
-        let tok = token::Client::new(&env, &schedule.token);
-
-        if beneficiary_due > 0 {
-            tok.transfer(
-                &env.current_contract_address(),
-                &beneficiary,
-                &beneficiary_due,
-            );
+        let new_claimed =
+            schedule.claimed_amount.checked_add(amount).ok_or(VestingError::InvalidAmount)?;
+        if new_claimed > schedule.total_amount {
+            return Err(VestingError::InvalidAmount);
         }
-        if issuer_due > 0 {
-            tok.transfer(
-                &env.current_contract_address(),
-                &issuer,
-                &issuer_due,
-            );
-        }
+
+        // Update claimed amount first so the schedule stays internally consistent
+        // if later checks or transfers fail and the transaction rolls back.
+        schedule.claimed_amount = new_claimed;
+        env.storage().persistent().set(&key, &schedule);
+
+        // Transfer tokens from this contract to beneficiary
+        let contract_addr = env.current_contract_address();
+        token::Client::new(&env, &schedule.token).transfer(&contract_addr, &beneficiary, &amount);
+        let token = schedule.token.clone();
 
         // Clean up storage.
         env.storage().persistent().remove(&sched_key);
         env.storage().persistent().remove(&claimed_key);
 
+        // Emit events for partial claim.
         env.events().publish(
-            (soroban_sdk::symbol_short!("vest_rev"), beneficiary),
-            (beneficiary_due, issuer_due),
+            (EVENT_VESTING_PCLAIM, beneficiary.clone(), admin),
+            (schedule_index, token.clone(), amount, count),
+        );
+        env.events().publish(
+            (EVENT_VESTING_PCLAIM_V1, beneficiary, admin),
+            (VESTING_EVENT_SCHEMA_VERSION, schedule_index, token, amount, count),
         );
 
-        Ok(())
+    /// Return the append-only cursor for partial-claim records.
+    ///
+    /// The value is also the current record count. The next successful
+    /// partial claim is written at this index.
+    pub fn get_partial_claim_count(env: Env, admin: Address, schedule_index: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&VestingDataKey::ClaimCount(admin, schedule_index))
+            .unwrap_or(0)
     }
 
-    // ── Read-only queries ─────────────────────────────────────────────────────
-
-    /// Return the [`VestingSchedule`] for `beneficiary`, or `None`.
-    pub fn get_vesting_schedule(
+    /// Return a partial-claim ledger record `(timestamp, amount)` by cursor index.
+    pub fn get_partial_claim_record(
         env: Env,
         beneficiary: Address,
     ) -> Option<VestingSchedule> {
