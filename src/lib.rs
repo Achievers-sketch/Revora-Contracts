@@ -694,6 +694,12 @@ const MAX_PAGE_LIMIT: u32 = 20;
 /// against on-chain storage by adding an unlimited number of entries.
 const MAX_BLACKLIST_SIZE: u32 = 200;
 
+/// Maximum number of addresses allowed in a single batch blacklist operation.
+/// Chosen to balance gas efficiency with predictable execution costs.
+/// Rationale: 50 addresses keeps worst-case gas usage well within Soroban limits
+/// while providing meaningful efficiency gains over single-address operations.
+const MAX_BATCH_SIZE: u32 = 50;
+
 /// Maximum platform fee in basis points (50%).
 const MAX_PLATFORM_FEE_BPS: u32 = 5_000;
 
@@ -2815,6 +2821,136 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Add multiple investors to the per-offering blacklist in a single transaction.
+    ///
+    /// Enables efficient bulk compliance updates by processing up to MAX_BATCH_SIZE (50)
+    /// addresses atomically. The operation is idempotent: addresses already blacklisted
+    /// are skipped without error. Events are emitted only for addresses that result in
+    /// actual state changes.
+    ///
+    /// ### Parameters
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer or admin.
+    /// - `issuer`: The issuer address of the offering.
+    /// - `namespace`: The namespace of the offering.
+    /// - `token`: The token representing the offering.
+    /// - `investors`: Vector of addresses to blacklist (max 50).
+    ///
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering or the contract admin.
+    /// - All-or-nothing semantics: if any validation fails, no addresses are added.
+    /// - Batch size is capped at MAX_BATCH_SIZE to keep gas costs predictable.
+    ///
+    /// ### Returns
+    /// - `Ok(())` on success.
+    /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::ContractPaused)` if the contract is paused.
+    /// - `Err(RevoraError::OfferingNotFound)` if the offering does not exist.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer or admin.
+    /// - `Err(RevoraError::LimitReached)` if batch size exceeds MAX_BATCH_SIZE.
+    /// - `Err(RevoraError::BlacklistSizeLimitExceeded)` if adding the batch would exceed MAX_BLACKLIST_SIZE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blacklist_add_many(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        investors: Vec<Address>,
+    ) -> Result<(), RevoraError> {
+        // Task 2.1: Authorization checks
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        // Task 2.2: Batch size validation
+        if investors.len() > MAX_BATCH_SIZE {
+            return Err(RevoraError::LimitReached);
+        }
+
+        // Handle empty batch case (idempotent no-op)
+        if investors.is_empty() {
+            return Ok(());
+        }
+
+        // Task 2.3: Offering existence check and authorization
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+
+        if caller != current_issuer && caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        // Task 2.3: Load storage
+        let key = DataKey::Blacklist(offering_id.clone());
+        let mut map: Map<Address, bool> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+        let order_key = DataKey::BlacklistOrder(offering_id.clone());
+        let mut order: Vec<Address> =
+            env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
+
+        // Task 2.4: Deduplication logic
+        let mut seen = Map::new(&env);
+        let mut unique_investors = Vec::new(&env);
+        for i in 0..investors.len() {
+            let investor = investors.get(i).unwrap();
+            if !seen.contains_key(investor.clone()) {
+                seen.set(investor.clone(), true);
+                unique_investors.push_back(investor);
+            }
+        }
+
+        // Task 2.5: Capacity validation
+        let current_size = map.len();
+        let mut new_count = 0u32;
+        for i in 0..unique_investors.len() {
+            let investor = unique_investors.get(i).unwrap();
+            if !map.contains_key(investor.clone()) {
+                new_count += 1;
+            }
+        }
+
+        if current_size + new_count > MAX_BLACKLIST_SIZE {
+            return Err(RevoraError::BlacklistSizeLimitExceeded);
+        }
+
+        // Task 2.6: Batch add logic with storage updates
+        for i in 0..unique_investors.len() {
+            let investor = unique_investors.get(i).unwrap();
+            let was_present = map.get(investor.clone()).unwrap_or(false);
+            
+            if !was_present {
+                // Add to map and order vec
+                if !Self::is_event_only(&env) {
+                    map.set(investor.clone(), true);
+                    order.push_back(investor.clone());
+                }
+                
+                // Emit event for actual state change
+                env.events().publish(
+                    (EVENT_BL_ADD, issuer.clone(), namespace.clone(), token.clone()),
+                    (caller.clone(), investor),
+                );
+            }
+            // If already blacklisted, skip without error or event (idempotent)
+        }
+
+        // Save updated storage
+        if !Self::is_event_only(&env) {
+            env.storage().persistent().set(&key, &map);
+            env.storage().persistent().set(&order_key, &order);
+        }
+
+        Ok(())
+    }
+
     /// Remove an investor from the per-offering blacklist.
     ///
     /// Re-enables the address to claim revenue for the specified token.
@@ -2884,6 +3020,125 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&order_key, &new_order);
 
         env.events().publish((EVENT_BL_REM, issuer, namespace, token), (caller, investor));
+        Ok(())
+    }
+
+    /// Remove multiple investors from the per-offering blacklist in a single transaction.
+    ///
+    /// Enables efficient bulk compliance updates by processing up to MAX_BATCH_SIZE (50)
+    /// addresses atomically. The operation is idempotent: addresses not currently blacklisted
+    /// are skipped without error. Events are emitted only for addresses that result in
+    /// actual state changes.
+    ///
+    /// ### Parameters
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer or admin.
+    /// - `issuer`: The issuer address of the offering.
+    /// - `namespace`: The namespace of the offering.
+    /// - `token`: The token representing the offering.
+    /// - `investors`: Vector of addresses to remove from blacklist (max 50).
+    ///
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering or the contract admin.
+    /// - All-or-nothing semantics: if any validation fails, no addresses are removed.
+    /// - Batch size is capped at MAX_BATCH_SIZE to keep gas costs predictable.
+    ///
+    /// ### Returns
+    /// - `Ok(())` on success.
+    /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::ContractPaused)` if the contract is paused.
+    /// - `Err(RevoraError::OfferingNotFound)` if the offering does not exist.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer or admin.
+    /// - `Err(RevoraError::LimitReached)` if batch size exceeds MAX_BATCH_SIZE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blacklist_remove_many(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        investors: Vec<Address>,
+    ) -> Result<(), RevoraError> {
+        // Task 3.1: Authorization checks
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        // Task 3.2: Batch size validation
+        if investors.len() > MAX_BATCH_SIZE {
+            return Err(RevoraError::LimitReached);
+        }
+
+        // Handle empty batch case (idempotent no-op)
+        if investors.is_empty() {
+            return Ok(());
+        }
+
+        // Task 3.3: Offering existence check and authorization
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+
+        if caller != current_issuer && caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        // Task 3.3: Load storage
+        let key = DataKey::Blacklist(offering_id.clone());
+        let mut map: Map<Address, bool> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+
+        // Task 3.4: Deduplication logic
+        let mut seen = Map::new(&env);
+        let mut unique_investors = Vec::new(&env);
+        for i in 0..investors.len() {
+            let investor = investors.get(i).unwrap();
+            if !seen.contains_key(investor.clone()) {
+                seen.set(investor.clone(), true);
+                unique_investors.push_back(investor);
+            }
+        }
+
+        // Task 3.5: Batch remove logic
+        for i in 0..unique_investors.len() {
+            let investor = unique_investors.get(i).unwrap();
+            let was_present = map.get(investor.clone()).unwrap_or(false);
+            
+            if was_present {
+                // Remove from map
+                map.remove(investor.clone());
+                
+                // Emit event for actual state change
+                env.events().publish(
+                    (EVENT_BL_REM, issuer.clone(), namespace.clone(), token.clone()),
+                    (caller.clone(), investor),
+                );
+            }
+            // If not blacklisted, skip without error or event (idempotent)
+        }
+
+        // Task 3.5: Rebuild order vec to maintain consistency
+        let order_key = DataKey::BlacklistOrder(offering_id.clone());
+        let old_order: Vec<Address> =
+            env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
+        let mut new_order = Vec::new(&env);
+        for i in 0..old_order.len() {
+            let addr = old_order.get(i).unwrap();
+            if map.get(addr.clone()).unwrap_or(false) {
+                new_order.push_back(addr);
+            }
+        }
+
+        // Save updated storage
+        env.storage().persistent().set(&key, &map);
+        env.storage().persistent().set(&order_key, &new_order);
+
         Ok(())
     }
 
