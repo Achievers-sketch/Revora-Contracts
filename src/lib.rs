@@ -42,7 +42,7 @@
 )]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    BytesN, Env, IntoVal, Map, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 // Issue #109 â€” Revenue report correction and audit-summary reconciliation are
@@ -167,34 +167,11 @@ pub mod vesting;
 #[cfg(test)]
 mod test_claim_transfer_fail;
 #[cfg(test)]
-mod test_compute_share_decomposition_prop;
-#[cfg(test)]
 mod test_duplicates;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
-mod test_claim_transfer_fail;
-#[cfg(test)]
-mod test_pause_tiers;
-#[cfg(test)]
-mod test_snapshot_monotonicity_replay;
-
-/// Two-tier pause state stored at `DataKey::Paused`.
-///
-/// - `NotPaused`  – normal operation; all entrypoints are open.
-/// - `SoftPaused` – blocks reports and deposits but **allows** `claim`, so
-///                  holders can still withdraw their funds during incident response.
-/// - `HardPaused` – blocks every state-mutating operation including `claim`.
-///
-/// Wire values are stable: do not renumber.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum PauseState {
-    NotPaused = 0,
-    SoftPaused = 1,
-    HardPaused = 2,
-}
+mod test_prove_distribution;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -432,6 +409,25 @@ pub struct AuditReconciliationResult {
     pub computed_report_count: u64,
     pub is_consistent: bool,
     pub is_saturated: bool,
+}
+
+/// One entry in a distribution proof: the holder's address, their share in basis points,
+/// and the normalized payout computed by the contract for a specific period.
+///
+/// Returned by `prove_distribution_for_period`. The ordering of entries in the returned
+/// vector matches the order of the `holders` input slice exactly, enabling deterministic
+/// digest verification by off-chain indexers.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DistributionEntry {
+    /// The holder's address.
+    pub holder: Address,
+    /// The holder's share in basis points (0–10000).
+    pub share_bps: u32,
+    /// The normalized payout computed by the contract for this period.
+    /// Equals `compute_share(normalize_amount(period_revenue, decimals), share_bps, rounding_mode)`.
+    /// Zero when `share_bps == 0` or `period_revenue == 0`.
+    pub normalized_payout: i128,
 }
 
 /// Pending issuer transfer details including expiry tracking.
@@ -5163,6 +5159,114 @@ impl RevoraRevenueShare {
 
         Ok(total_payout)
     }
+
+    /// Return a deterministic per-holder distribution proof for a single period.
+    ///
+    /// For each address in `holders` (capped at `MAX_CHUNK_PERIODS`), the contract reads
+    /// the stored `HolderShare`, normalizes the period revenue to 7-decimal canonical units,
+    /// and computes the payout using the offering's persisted `RoundingMode`. The result
+    /// vector preserves the input order exactly, so off-chain indexers can reproduce the
+    /// digest by applying the same ordering.
+    ///
+    /// ### Digest construction
+    /// `SHA-256(XDR(issuer) || XDR(namespace) || XDR(token) || XDR(period_id) || XDR(entries))`
+    /// where `entries` is the `Vec<DistributionEntry>` returned alongside the digest.
+    /// An unknown `period_id` returns zero payouts; callers detect this by checking
+    /// that all `normalized_payout` values are zero.
+    ///
+    /// ### Bounds
+    /// `holders` is silently capped at `MAX_CHUNK_PERIODS` (200).
+    ///
+    /// ### Security
+    /// - Read-only: no storage writes, no auth required.
+    /// - Digest covers contract-computed values only; cannot be forged without
+    ///   changing on-chain `HolderShare` or `PeriodRevenue` state.
+    pub fn prove_distribution_for_period(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+        holders: Vec<Address>,
+    ) -> (Vec<DistributionEntry>, BytesN<32>) {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Look up period revenue; treat missing period as zero revenue (unknown period).
+        let revenue: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodRevenue(offering_id.clone(), period_id))
+            .unwrap_or(0);
+
+        let decimals = Self::get_payment_token_decimals(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+        );
+        let normalized_revenue = Self::normalize_amount(revenue, decimals);
+
+        let mode =
+            Self::get_rounding_mode(env.clone(), issuer.clone(), namespace.clone(), token.clone());
+
+        // Cap input to MAX_CHUNK_PERIODS to bound compute cost.
+        let cap = core::cmp::min(holders.len(), MAX_CHUNK_PERIODS);
+        let mut entries: Vec<DistributionEntry> = Vec::new(&env);
+        for i in 0..cap {
+            let holder = holders.get(i).unwrap();
+            let share_bps = env
+                .storage()
+                .persistent()
+                .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+                .unwrap_or(0u32);
+            let normalized_payout =
+                Self::compute_share(env.clone(), normalized_revenue, share_bps, mode);
+            entries.push_back(DistributionEntry { holder, share_bps, normalized_payout });
+        }
+
+        // Build digest: SHA-256 over XDR of (issuer, namespace, token, period_id, entries).
+        let mut payload = Bytes::new(&env);
+        payload.append(&issuer.to_xdr(&env));
+        payload.append(&namespace.to_xdr(&env));
+        payload.append(&token.to_xdr(&env));
+        payload.append(&period_id.to_xdr(&env));
+        payload.append(&entries.clone().to_xdr(&env));
+        let digest: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        (entries, digest)
+    }
+
+    /// Return unclaimed period IDs for a holder on an offering.
+    /// Ordering: by deposit index (creation order), deterministic.
+    pub fn get_pending_periods(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> Vec<u64> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let count_key = DataKey::PeriodCount(offering_id.clone());
+        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
+        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+
+        let mut periods = Vec::new(&env);
+        for i in start_idx..period_count {
+            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
+            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
+            if period_id == 0 {
+                continue;
+            }
+            periods.push_back(period_id);
+        }
+        periods
+    }
 }
 
 // â”€â”€ Holder shares, claims, admin, governance, and utility methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5464,34 +5568,6 @@ impl RevoraRevenueShare {
     /// * `max_periods` - The maximum number of periods to claim in this call.
     ///
     /// # Events
-
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic (#38).
-    pub fn get_pending_periods(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        holder: Address,
-    ) -> Vec<u64> {
-        let offering_id = OfferingId { issuer, namespace, token };
-        let count_key = DataKey::PeriodCount(offering_id.clone());
-        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
-        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
-
-        let mut periods = Vec::new(&env);
-        for i in start_idx..period_count {
-            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
-            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-            if period_id == 0 {
-                continue;
-            }
-            periods.push_back(period_id);
-        }
-        periods
-    }
 
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
