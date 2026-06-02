@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 #![deny(unsafe_code)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
@@ -37,7 +37,8 @@
     clippy::manual_let_else,
     clippy::empty_line_after_doc_comments,
     clippy::doc_lazy_continuation,
-    clippy::unnecessary_lazy_evaluations
+    clippy::unnecessary_lazy_evaluations,
+    clippy::enum_variant_names
 )]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
@@ -1193,7 +1194,11 @@ impl RevoraRevenueShare {
             (holder.clone(), share_bps),
         );
         // Versioned v2 event: [2, holder, share_bps] — always emitted (#RC26Q2-C31)
-        Self::emit_v2_event(env, (EVENT_SHARE_SET_V2, issuer, namespace, token), (holder, share_bps));
+        Self::emit_v2_event(
+            env,
+            (EVENT_SHARE_SET_V2, issuer, namespace, token),
+            (holder, share_bps),
+        );
         Ok(())
     }
 
@@ -4694,7 +4699,7 @@ impl RevoraRevenueShare {
                 .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
                 .unwrap_or(0);
 
-            let new_total = current_total.saturating_sub(old_share).saturating_add(*share_bps);
+            let new_total = current_total.saturating_sub(old_share).saturating_add(share_bps);
             if new_total > 10_000 {
                 return Err(RevoraError::InvalidShareBps);
             }
@@ -4705,7 +4710,7 @@ impl RevoraRevenueShare {
                 .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
 
             current_total = new_total;
-            added_bps = added_bps.saturating_add(*share_bps);
+            added_bps = added_bps.saturating_add(share_bps);
         }
 
         // Update snapshot metadata.
@@ -4716,7 +4721,9 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&entry_key, &entry);
 
         // Persist updated per-offering running total.
-        env.storage().persistent().set(&DataKey::HolderShareTotal(offering_id.clone()), &current_total);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HolderShareTotal(offering_id.clone()), &current_total);
 
         env.events().publish(
             (EVENT_SNAP_SHARES_APPLIED, issuer, namespace, token),
@@ -4773,7 +4780,11 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
         issuer.require_auth();
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         Self::get_current_issuer(
             &env,
             issuer.clone(),
