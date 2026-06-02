@@ -169,6 +169,8 @@ mod test_claim_transfer_fail;
 #[cfg(test)]
 mod test_duplicates;
 #[cfg(test)]
+mod test_override_audit_trail;
+#[cfg(test)]
 mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
 mod test_prove_distribution;
