@@ -261,8 +261,8 @@ mod tests {
         // constant was not bumped alongside the enum change.
         const {
             assert!(
-                CONTRACT_VERSION >= 5,
-                "CONTRACT_VERSION must be >= 5 after the TransferFailed renumber"
+                CONTRACT_VERSION.0 >= 1,
+                "CONTRACT_VERSION major must be >= 1 after the TransferFailed renumber"
             );
         }
     }

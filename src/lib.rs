@@ -361,10 +361,41 @@ const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("dly_set");
 /// Represents a revenue-share offering registered on-chain.
 /// Offerings are immutable once registered.
 // â”€â”€ Data structures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-/// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
-pub const CONTRACT_VERSION: u32 = 23;
+/// Semantic version (MAJOR, MINOR, PATCH) for contract upgrades (#23).
+/// A `migrate_storage` call must pass a version strictly greater than the
+/// currently deployed version. Downgrades and no-op migrations are rejected.
+/// Bumped when storage or semantics change; used for migration and compatibility.
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 0, 23);
 /// Persistent storage layout version. Bump when adding/renaming DataKey variants.
 pub const STORAGE_LAYOUT_VERSION: u32 = 1;
+
+/// Assert that `to` is a strict forward semver upgrade over `from`.
+///
+/// # Errors
+/// - [`RevoraError::AlreadyAtTargetVersion`] if `to == from` (no-op migration)
+/// - [`RevoraError::MigrationDowngradeNotAllowed`] if `to < from` (downgrade)
+///
+/// # Semver ordering
+/// Comparison is lexicographic on `(major, minor, patch)`:
+/// - Any increase in `major` is a valid upgrade (breaking change).
+/// - Same major, higher minor is valid (backward-compatible addition).
+/// - Same major and minor, higher patch is valid (bugfix).
+/// - Any decrease in any component is a downgrade.
+pub fn assert_semver_forward(
+    from: (u32, u32, u32),
+    to: (u32, u32, u32),
+) -> Result<(), RevoraError> {
+    if to == from {
+        return Err(RevoraError::AlreadyAtTargetVersion);
+    }
+    if to.0 < from.0
+        || (to.0 == from.0 && to.1 < from.1)
+        || (to.0 == from.0 && to.1 == from.1 && to.2 < from.2)
+    {
+        return Err(RevoraError::MigrationDowngradeNotAllowed);
+    }
+    Ok(())
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -5222,9 +5253,54 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&DataKey::ClaimDelaySecs(offering_id)).unwrap_or(0)
     }
 
-    /// Return the current contract version (#23).
-    pub fn get_version(_env: Env) -> u32 {
+    /// Return the current contract version as a semver triple (MAJOR, MINOR, PATCH) (#23).
+    pub fn get_version(_env: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
+    }
+
+    /// Migrate the contract storage to a new version.
+    ///
+    /// Reads the currently stored `DeployedVersion` (defaulting to [`CONTRACT_VERSION`]
+    /// if absent) and rejects the call if:
+    /// - The contract is not initialized (`NotInitialized`)
+    /// - The caller is not the admin (`NotAuthorized`)
+    /// - The contract is frozen (`ContractFrozen`)
+    /// - `target` equals the stored version (`AlreadyAtTargetVersion`)
+    /// - `target` is a semver downgrade (`MigrationDowngradeNotAllowed`)
+    ///
+    /// On success, persists `target` as the new `DeployedVersion` and emits a
+    /// `(symbol_short!("migrate"), (from, to))` event.
+    pub fn migrate_storage(
+        env: Env,
+        caller: Address,
+        target_major: u32,
+        target_minor: u32,
+        target_patch: u32,
+    ) -> Result<(), RevoraError> {
+        caller.require_auth();
+
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Frozen).unwrap_or(false) {
+            return Err(RevoraError::ContractFrozen);
+        }
+
+        let from = env
+            .storage()
+            .persistent()
+            .get::<DataKey, (u32, u32, u32)>(&DataKey::DeployedVersion)
+            .unwrap_or(CONTRACT_VERSION);
+        let to = (target_major, target_minor, target_patch);
+
+        assert_semver_forward(from, to)?;
+
+        env.storage().persistent().set(&DataKey::DeployedVersion, &to);
+        env.events().publish((symbol_short!("migrate"),), (from, to));
+        Ok(())
     }
 
     /// Configure the reporting access window for an offering. If unset, always open.
