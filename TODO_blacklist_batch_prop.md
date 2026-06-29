@@ -1,14 +1,13 @@
-# TODO: #477 Add proptest harness for blacklist add/remove state convergence
+TODO: #477 proptest harness for blacklist_add_many/remove_many order-independence
 
-## Steps
-- [ ] Rework `src/test_blacklist_batch_prop.rs` into a correct, compiling proptest harness.
-  - [ ] Generate `add_vec` and `rem_vec` using `proptest::collection::vec(any::<u8>(), 0..50)`.
-  - [ ] Map u8 values to deterministic Addresses via a fixed address pool (enables duplicates/overlaps).
-  - [ ] Run the contract twice: original input order vs shuffled input order.
-  - [ ] Assert final blacklist state equality (compare sorted address vecs).
-  - [ ] Collect `bl_add` and `bl_rem` events only; normalize to `(kind, caller, investor)` and compare as a multiset via sorting.
-  - [ ] Edge case: if both vectors are empty, assert no `bl_*` events were emitted (ignore setup events).
-- [ ] Ensure the test compiles and is included in `cargo test` automatically.
-- [ ] Run `cargo test --all`.
-- [ ] If failures occur, fix compilation/runtime issues and re-run.
+1. Update src/test_blacklist_batch_prop.rs:
+   - Scope event collection to only events emitted by blacklist_add_many/remove_many (use before/after event indices).
+   - Enforce empty-input no-op semantics: if addrs empty => no bl_add events; if rem_addrs empty => no bl_rem events.
+   - Strengthen duplicate/overlap coverage in vectors.
+   - Assert final blacklist state equality as deduped set (sorted unique addresses).
+   - Assert emitted blacklist events equality as order-independent multiset.
+2. Run cargo test --all.
+3. Ensure all lint/format is clean.
+4. Commit as: test: add proptest for blacklist batch order-independence.
+5. Push branch and open PR.
 
