@@ -584,8 +584,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        i128::MAX / 10_000 * 10_000 + 9_999, // Max remainder
-        i128::MIN / 10_000 * 10_000 - 9_999, // Min remainder
+        (i128::MAX / 10_000 - 1) * 10_000 + 9_999, // Large positive with near-max remainder
+        (i128::MIN / 10_000 + 1) * 10_000 - 9_999, // Large negative with near-min remainder
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];
