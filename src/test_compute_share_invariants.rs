@@ -48,8 +48,11 @@
 
 #![cfg(test)]
 
+extern crate alloc;
+
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use alloc::format;
+use soroban_sdk::Env;
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -623,7 +626,7 @@ fn checked_mul_defense_in_depth_prevents_overflow() {
     let extreme_amounts = [i128::MAX, i128::MIN, i128::MAX - 1, i128::MIN + 1];
 
     for &amount in &extreme_amounts {
-        for &bps in [1_u32, 5_000, 10_000] {
+        for &bps in &[1_u32, 5_000, 10_000] {
             let result = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             // Should never panic and should always satisfy bounds
             assert_bounds(result, amount, &format!("Extreme amount={amount} bps={bps}"));

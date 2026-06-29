@@ -150,7 +150,7 @@ pub enum RevoraError {
     /// Issuer transfer has expired.
     IssuerTransferExpired = 43,
     /// Transfer blocked because the offering has pre-cliff vesting schedules.
-    VestingTransferBlocked = 48,
+    VestingTransferBlocked = 52,
     /// Contract is paused.
     ContractPaused = 44,
     /// Blacklist size limit exceeded.
@@ -170,10 +170,16 @@ pub enum RevoraError {
     /// Wire value: 48. Stable since v1.
     PeriodAlreadyClosed = 48,
 
+    /// Concentration enforcement requires a fresh `report_concentration`, but the stored
+    /// concentration data is missing or older than the configured staleness window.
+    ///
+    /// Wire value: 53. Stable since v1.
+    StaleConcentrationData = 53,
+
     /// Disclosure URI exceeds the 256-byte maximum.
-    DisclosureUriTooLong = 51,
+    DisclosureUriTooLong = 54,
     /// Empty URI paired with a non-zero hash is incoherent.
-    InconsistentDisclosure = 52,
+    InconsistentDisclosure = 55,
 }
 
 pub mod vesting;
@@ -635,11 +641,28 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
+/// Tiered pause state for the contract.
+///
+/// - `NotPaused`  – all operations open.
+/// - `SoftPaused` – reports/deposits blocked; `claim` still allowed.
+/// - `HardPaused` – all state-mutating operations blocked, including `claim`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PauseState {
+    NotPaused,
+    SoftPaused,
+    HardPaused,
+}
+
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
+///
+/// Scoped to the crate: storage keys are an internal implementation detail and are not part
+/// of the contract's external interface, so no contract spec entry is generated for them.
+/// This also keeps the enum clear of the 50-case spec union limit as new keys are added.
 #[contracttype]
 #[derive(Clone)]
-pub enum DataKey {
+pub(crate) enum DataKey {
     /// Deprecated shared period tracker retained for backward compatibility with older storage.
     LastPeriodId(OfferingId),
     Blacklist(OfferingId),
@@ -791,6 +814,15 @@ pub enum DataKey2 {
 
     /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
     DisclosureMeta(OfferingId),
+
+    /// Per-offering minimum revenue threshold below which reports are skipped.
+    MinRevenueThreshold(OfferingId),
+    /// Per-offering cumulative deposited revenue tracker.
+    DepositedRevenue(OfferingId),
+    /// Per-offering investment constraints (min/max stake).
+    InvestmentConstraints(OfferingId),
+    /// Per-offering supply cap (0 = uncapped).
+    SupplyCap(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1842,7 +1874,7 @@ impl RevoraRevenueShare {
         let effective_expiry = if expiry_secs == 0 {
             0
         } else {
-            expiry_secs.max(MIN_ISSUER_TRANSFER_EXPIRY_SECS).min(MAX_ISSUER_TRANSFER_EXPIRY_SECS)
+            expiry_secs.clamp(MIN_ISSUER_TRANSFER_EXPIRY_SECS, MAX_ISSUER_TRANSFER_EXPIRY_SECS)
         };
 
         let timestamp = env.ledger().timestamp();
@@ -5655,7 +5687,7 @@ impl RevoraRevenueShare {
 
         // Coherence guard: non-zero hash requires a URI.
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        if uri.len() == 0 && hash != zero_hash {
+        if uri.is_empty() && hash != zero_hash {
             return Err(RevoraError::InconsistentDisclosure);
         }
 
@@ -5984,7 +6016,6 @@ impl RevoraRevenueShare {
     /// * `max_periods` - The maximum number of periods to claim in this call.
     ///
     /// # Events
-
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
     /// periods remain, otherwise `None`. `limit` of 0 or greater than `MAX_PAGE_LIMIT` will be
