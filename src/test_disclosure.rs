@@ -17,7 +17,11 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events as _}, symbol_short, Address, Bytes, BytesN, Env};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events as _},
+    Address, Bytes, BytesN, Env,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -55,14 +59,14 @@ fn zero_hash(env: &Env) -> BytesN<32> {
 }
 
 fn sample_hash(env: &Env) -> BytesN<32> {
-    BytesN::from_array(env, &[0xde, 0xad, 0xbe, 0xef,
-                               0x00, 0x01, 0x02, 0x03,
-                               0x04, 0x05, 0x06, 0x07,
-                               0x08, 0x09, 0x0a, 0x0b,
-                               0x0c, 0x0d, 0x0e, 0x0f,
-                               0x10, 0x11, 0x12, 0x13,
-                               0x14, 0x15, 0x16, 0x17,
-                               0x18, 0x19, 0x1a, 0x1b])
+    BytesN::from_array(
+        env,
+        &[
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+        ],
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -162,8 +166,7 @@ fn update_disclosure_unknown_offering_returns_not_found() {
     let uri = Bytes::from_slice(&env, b"ipfs://anything");
     let hash = sample_hash(&env);
 
-    let result =
-        client.try_update_disclosure(&issuer, &symbol_short!("ns"), &token, &uri, &hash);
+    let result = client.try_update_disclosure(&issuer, &symbol_short!("ns"), &token, &uri, &hash);
     assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
 }
 
@@ -188,5 +191,8 @@ fn update_disclosure_emits_event() {
 
     let before = env.events().all().len();
     client.update_disclosure(&issuer, &ns, &token, &uri, &hash);
-    assert!(env.events().all().len() > before, "expected at least one new event after update_disclosure");
+    assert!(
+        env.events().all().len() > before,
+        "expected at least one new event after update_disclosure"
+    );
 }
