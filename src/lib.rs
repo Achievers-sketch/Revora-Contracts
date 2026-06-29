@@ -169,6 +169,11 @@ pub enum RevoraError {
     ///
     /// Wire value: 48. Stable since v1.
     PeriodAlreadyClosed = 48,
+
+    /// Disclosure URI exceeds the 256-byte maximum.
+    DisclosureUriTooLong = 51,
+    /// Empty URI paired with a non-zero hash is incoherent.
+    InconsistentDisclosure = 52,
 }
 
 pub mod vesting;
@@ -190,6 +195,8 @@ mod test_min_revenue_threshold_boundary;
 // mod test_claim_transfer_fail;
 #[cfg(test)]
 mod test_close_period;
+#[cfg(test)]
+mod test_disclosure;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -300,6 +307,8 @@ const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 /// Emitted when a period is sealed by `close_period`.
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
+/// Emitted when an offering's off-chain disclosure metadata is set or updated (#485).
+const EVENT_DISCLOSURE_UPDATED: Symbol = symbol_short!("disc_upd");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
 const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
@@ -419,6 +428,18 @@ pub struct ConcentrationLimitConfig {
 pub struct InvestmentConstraintsConfig {
     pub min_stake: i128,
     pub max_stake: i128,
+}
+
+/// Off-chain disclosure binding for an offering (#485).
+/// Binds a URI (PPM, K-1 template, etc.) to a 32-byte integrity hash so
+/// investors can verify the off-chain document without trusting the issuer alone.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisclosureMeta {
+    /// Off-chain document URI, e.g. `ipfs://…` or `https://…`. Max 256 bytes.
+    pub uri: Bytes,
+    /// SHA-256 (or equivalent) hash of the document at `uri`. Exactly 32 bytes.
+    pub hash: BytesN<32>,
 }
 
 /// Per-offering audit log summary (#34).
@@ -767,6 +788,9 @@ pub enum DataKey2 {
 
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
+
+    /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
+    DisclosureMeta(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -5551,6 +5575,77 @@ impl RevoraRevenueShare {
     ) -> bool {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().has(&DataKey2::ClosedPeriod(offering_id, period_id))
+    }
+
+    /// Attach or replace off-chain disclosure metadata for an offering (#485).
+    ///
+    /// Issuers use this to bind a private placement memorandum (PPM), K-1 template,
+    /// or any other off-chain document to the on-chain record so investors can verify
+    /// the document's integrity via the stored hash.
+    ///
+    /// ### Validation
+    /// - `uri` must be at most 256 bytes; longer values return `DisclosureUriTooLong`.
+    /// - An empty `uri` paired with a non-zero `hash` returns `InconsistentDisclosure`.
+    ///   (A zero-hash with an empty URI clears any previous disclosure.)
+    ///
+    /// ### Auth ordering
+    /// `issuer.require_auth()` is called immediately after the frozen guard.
+    pub fn update_disclosure(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        uri: Bytes,
+        hash: BytesN<32>,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // URI length guard: max 256 bytes.
+        if uri.len() > 256 {
+            return Err(RevoraError::DisclosureUriTooLong);
+        }
+
+        // Coherence guard: non-zero hash requires a URI.
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if uri.len() == 0 && hash != zero_hash {
+            return Err(RevoraError::InconsistentDisclosure);
+        }
+
+        let key = DataKey2::DisclosureMeta(offering_id);
+        env.storage().persistent().set(&key, &DisclosureMeta { uri: uri.clone(), hash: hash.clone() });
+
+        Self::emit_v2_event(
+            &env,
+            (EVENT_DISCLOSURE_UPDATED, issuer, namespace, token),
+            (uri, hash),
+        );
+
+        Ok(())
+    }
+
+    /// Return the off-chain disclosure metadata for an offering, if set.
+    pub fn get_disclosure(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<DisclosureMeta> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::DisclosureMeta(offering_id))
     }
 }
 
