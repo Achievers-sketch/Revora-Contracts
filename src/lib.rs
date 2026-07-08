@@ -2871,19 +2871,12 @@ impl RevoraRevenueShare {
                 .set(&DataKey::ClaimDelaySecs(new_offering_id.clone()), &delay);
             env.storage().persistent().remove(&DataKey::ClaimDelaySecs(offering_id.clone()));
         }
-        if let Some(allowed_jurisdictions) = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<Symbol>>(&DataKey2::AllowedJurisdictions(offering_id.clone()))
+        if let Some(snap_config) =
+            env.storage().persistent().get::<_, bool>(&DataKey::SnapshotConfig(offering_id.clone()))
         {
-            env.storage().persistent().set(
-                &DataKey2::AllowedJurisdictions(new_offering_id.clone()),
-                &allowed_jurisdictions,
-            );
-            env.storage().persistent().remove(&DataKey2::AllowedJurisdictions(offering_id.clone()));
-        }
-        if let Some(snap_config) = env.storage().persistent().get::<_, bool>(&DataKey::SnapshotConfig(offering_id.clone())) {
-            env.storage().persistent().set(&DataKey::SnapshotConfig(new_offering_id.clone()), &snap_config);
+            env.storage()
+                .persistent()
+                .set(&DataKey::SnapshotConfig(new_offering_id.clone()), &snap_config);
             env.storage().persistent().remove(&DataKey::SnapshotConfig(offering_id.clone()));
         }
         if let Some(snap_ref) =
@@ -6808,6 +6801,74 @@ impl RevoraRevenueShare {
         );
 
         Ok(total_payout)
+    }
+
+    /// Seal a reporting period so that no further `report_revenue` overrides are accepted.
+    ///
+    /// Once closed, the period's deposited revenue remains claimable by holders; only
+    /// issuer-initiated corrections via `override_existing=true` are blocked.
+    ///
+    /// ### Auth
+    /// Requires `issuer.require_auth()`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` – offering does not exist or caller is not the current issuer.
+    /// - `InvalidPeriodId` – `period_id` is 0.
+    /// - `PeriodAlreadyClosed` – period has already been sealed.
+    /// - `ContractFrozen` / `ContractPaused` – contract is not operational.
+    pub fn close_period(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Verify offering exists and caller is the current issuer.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let closed_key = DataKey2::ClosedPeriod(offering_id, period_id);
+        if env.storage().persistent().has(&closed_key) {
+            return Err(RevoraError::PeriodAlreadyClosed);
+        }
+
+        let closed_at = env.ledger().timestamp();
+        env.storage().persistent().set(&closed_key, &closed_at);
+
+        env.events()
+            .publish((EVENT_PERIOD_CLOSED, issuer, namespace, token), (period_id, closed_at));
+
+        Ok(())
+    }
+
+    /// Return `true` if the given period has been sealed by `close_period`.
+    pub fn is_period_closed(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+    ) -> bool {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().has(&DataKey2::ClosedPeriod(offering_id, period_id))
     }
 }
 

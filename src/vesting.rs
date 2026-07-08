@@ -244,11 +244,10 @@ pub fn migrate_offering_schedules(
             .persistent()
             .get::<VestingKey, VestingSchedule>(&VestingKey::Schedule(beneficiary.clone()))
         {
-            if schedule.issuer == offering_id.issuer
-                && schedule.token == offering_id.token
-                && now < schedule.cliff_ts
-            {
-                return Err(VestingError::SchedulePreCliff);
+            if schedule.issuer == offering_id.issuer && schedule.token == offering_id.token {
+                if now < schedule.cliff_ts {
+                    return Err(VestingError::SchedulePreCliff);
+                }
             }
         }
     }

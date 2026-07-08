@@ -319,12 +319,9 @@ fn round_half_up_gte_truncation_for_positive_amounts() {
         for &bps in bps_values {
             let t = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             let r = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
-            assert!(
-                r >= t,
-                "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}"
-            );
-            assert_bounds(t, amount, "Truncation");
-            assert_bounds(r, amount, "RoundHalfUp");
+            assert!(r >= t, "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}");
+            assert_bounds(t, amount, &format!("Truncation amount={amount} bps={bps}"));
+            assert_bounds(r, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
         }
     }
 }
@@ -589,8 +586,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        i128::MAX / 10_000 * 10_000, // Near-max, divisible by 10_000
-        i128::MIN / 10_000 * 10_000, // Near-min, divisible by 10_000
+        i128::MAX / 10_000 * 10_000 + 9_999, // Max remainder
+        i128::MIN / 10_000 * 10_000 - 9_999, // Min remainder
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];
