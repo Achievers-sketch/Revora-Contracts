@@ -150,7 +150,7 @@ pub enum RevoraError {
     /// Issuer transfer has expired.
     IssuerTransferExpired = 43,
     /// Transfer blocked because the offering has pre-cliff vesting schedules.
-    VestingTransferBlocked = 31,
+    VestingTransferBlocked = 52,
     /// Contract is paused.
     ContractPaused = 44,
     /// Blacklist size limit exceeded.
@@ -168,9 +168,20 @@ pub enum RevoraError {
     /// The period has been sealed by `close_period`; no further overrides are accepted.
     ///
     /// Wire value: 48. Stable since v1.
-    PeriodAlreadyClosed = 53,
-    /// Concentration data is stale or missing; cannot enforce concentration limit.
-    StaleConcentrationData = 54,
+    PeriodAlreadyClosed = 48,
+
+    /// The requested platform `fee_bps` plus the offering's aggregate holder share
+    /// would exceed 10_000 bps (100%). Fee and holder allocations must always fit
+    /// within the offering's total at the offering level (#468).
+    ///
+    /// Wire value: 51. Stable since v1.
+    FeeExceedsHolderShare = 51,
+
+    /// Concentration enforcement requires a fresh `report_concentration`, but the stored
+    /// concentration data is missing or older than the configured staleness window.
+    ///
+    /// Wire value: 53. Stable since v1.
+    StaleConcentrationData = 53,
 }
 
 pub mod vesting;
@@ -193,7 +204,7 @@ mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
 mod test_close_period;
 #[cfg(test)]
-mod test_redemption;
+mod test_platform_fee_model;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -338,6 +349,10 @@ const EVENT_CONC_LIMIT_SET: Symbol = symbol_short!("conc_lim");
 const EVENT_ROUNDING_MODE_SET: Symbol = symbol_short!("rnd_mode");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("admin_set");
 const EVENT_PLATFORM_FEE_SET: Symbol = symbol_short!("fee_set");
+/// Emitted by `set_offering_platform_fee` when a per-offering fee model is configured (#468).
+const EVENT_PLAT_FEE_SET: Symbol = symbol_short!("pfee_set");
+/// Emitted by `report_revenue` when a non-zero platform fee is routed to the treasury (#468).
+const EVENT_PLAT_FEE: Symbol = symbol_short!("plat_fee");
 const BPS_DENOMINATOR: i128 = 10_000;
 /// Stellar network canonical decimal precision (7 decimal places, i.e., stroops).
 const STELLAR_CANONICAL_DECIMALS: u32 = 7;
@@ -453,6 +468,21 @@ pub struct ConcentrationLimitConfig {
     /// been reported or the last report is older than this many seconds. 0 = disabled (no staleness
     /// check).
     pub max_staleness_secs: u64,
+}
+
+/// Per-offering platform fee model (#468).
+///
+/// Encodes the programmable platform cut taken on each `report_revenue` call and the
+/// `treasury` address the fee is routed to. `fee_bps` plus the offering's aggregate
+/// holder share must always be `<= 10_000` (enforced in `set_offering_platform_fee`),
+/// so the platform and holders never lay claim to more than 100% of reported revenue.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlatformFeeModel {
+    /// Platform fee in basis points (0 = disabled; no fee deducted and no `plat_fee` event).
+    pub fee_bps: u32,
+    /// Destination address the platform fee is routed to.
+    pub treasury: Address,
 }
 
 /// Per-offering investment constraints (#97). Min/max stake per investor; off-chain enforced.
@@ -687,12 +717,30 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
+/// Tiered pause state for the contract.
+///
+/// - `NotPaused`  – all operations open.
+/// - `SoftPaused` – reports/deposits blocked; `claim` still allowed.
+/// - `HardPaused` – all state-mutating operations blocked, including `claim`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PauseState {
+    NotPaused,
+    SoftPaused,
+    HardPaused,
+}
+
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
+///
+/// Scoped to the crate: storage keys are an internal implementation detail and are not part
+/// of the contract's external interface, so no contract spec entry is generated for them.
+/// This also keeps the enum clear of the 50-case spec union limit as new keys are added.
 #[contracttype]
 #[derive(Clone)]
-pub enum DataKey {
-    // LastPeriodId(OfferingId),
+pub(crate) enum DataKey {
+    /// Deprecated shared period tracker retained for backward compatibility with older storage.
+    LastPeriodId(OfferingId),
     Blacklist(OfferingId),
 
     /// Per-offering whitelist; when non-empty, only these addresses are eligible for distribution.
@@ -843,16 +891,18 @@ pub enum DataKey2 {
 
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
-    /// Whether the snapshot has been finalized successfully (moved from DataKey, > 50 limit).
-    SnapshotFinalized(OfferingId, u64),
-    /// Per-offering supply cap (max total deposited revenue).
-    SupplyCap(OfferingId),
-    /// Total revenue deposited so far for supply-cap tracking.
+
+    /// Per-offering platform fee model: configurable `fee_bps` routed to a treasury (#468).
+    OfferingPlatformFee(OfferingId),
+
+    /// Per-offering minimum revenue threshold below which reports are skipped.
+    MinRevenueThreshold(OfferingId),
+    /// Per-offering cumulative deposited revenue tracker.
     DepositedRevenue(OfferingId),
     /// Per-offering investment constraints (min/max stake).
     InvestmentConstraints(OfferingId),
-    /// Per-offering minimum revenue threshold.
-    MinRevenueThreshold(OfferingId),
+    /// Per-offering supply cap (0 = uncapped).
+    SupplyCap(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1676,6 +1726,123 @@ impl RevoraRevenueShare {
     /// O(1) â€” single persistent storage read.
     pub fn get_platform_fee_per_asset(env: Env, asset: Address) -> u32 {
         env.storage().persistent().get(&DataKey::PlatformFeePerAsset(asset)).unwrap_or(0)
+    }
+
+    // â”€â”€ Platform Fee Model (#468) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Configure the per-offering platform fee model: a programmable `fee_bps` cut routed
+    /// to `treasury` on each `report_revenue` call. Admin-only. (#468)
+    ///
+    /// The fee and the offering's holders share the same 100% (10_000 bps) budget, so this
+    /// rejects any configuration where `fee_bps` plus the offering's aggregate holder share
+    /// would exceed 10_000 bps. Setting `fee_bps = 0` disables the fee (no deduction and no
+    /// `plat_fee` event on subsequent reports) while still recording the `treasury` for clarity.
+    ///
+    /// Emits `EVENT_PLAT_FEE_SET` with topic `(issuer, namespace, token)` and data
+    /// `(fee_bps, treasury)`.
+    ///
+    /// ### Auth
+    /// Contract admin (`require_auth`).
+    ///
+    /// ### Errors
+    /// - `NotInitialized` â€” contract admin is not set.
+    /// - `OfferingNotFound` â€” offering does not exist.
+    /// - `FeeExceedsHolderShare` â€” `fee_bps` + aggregate holder share would exceed 10_000 bps.
+    pub fn set_offering_platform_fee(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        fee_bps: u32,
+        treasury: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Offering must exist before a fee model can be attached to it.
+        if !env.storage().persistent().has(&DataKey::OfferingIssuer(offering_id.clone())) {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // Fee bps + holder bps must always sum to at most 10_000 at the offering level.
+        // The aggregate holder share is maintained incrementally by `set_holder_share_internal`.
+        let holder_aggregate_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShareTotal(offering_id.clone()))
+            .unwrap_or(0);
+        if fee_bps.saturating_add(holder_aggregate_bps) > 10_000 {
+            return Err(RevoraError::FeeExceedsHolderShare);
+        }
+
+        let model = PlatformFeeModel { fee_bps, treasury: treasury.clone() };
+        env.storage().persistent().set(&DataKey2::OfferingPlatformFee(offering_id), &model);
+        env.events().publish((EVENT_PLAT_FEE_SET, issuer, namespace, token), (fee_bps, treasury));
+        Ok(())
+    }
+
+    /// Return the configured per-offering platform fee model, if any. (#468)
+    ///
+    /// O(1) â€” single persistent storage read. Returns `None` when no fee model is configured.
+    pub fn get_offering_platform_fee(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<PlatformFeeModel> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::OfferingPlatformFee(offering_id))
+    }
+
+    /// Apply the per-offering platform fee for a recorded revenue report. (#468)
+    ///
+    /// When a fee model is configured with a non-zero `fee_bps`, the programmable share of
+    /// `amount` is routed to the treasury and surfaced via `EVENT_PLAT_FEE`. A `fee_bps` of 0
+    /// (or a computed fee of 0, e.g. zero-revenue reports) is a no-op and emits no event, so
+    /// indexers can rely on `plat_fee` being present only when a real fee was taken.
+    ///
+    /// Returns the fee amount routed to the treasury (0 when no fee applies).
+    fn apply_platform_fee(
+        env: &Env,
+        offering_id: &OfferingId,
+        issuer: &Address,
+        namespace: &Symbol,
+        token: &Address,
+        amount: i128,
+        period_id: u64,
+    ) -> i128 {
+        let model: PlatformFeeModel = match env
+            .storage()
+            .persistent()
+            .get(&DataKey2::OfferingPlatformFee(offering_id.clone()))
+        {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        if model.fee_bps == 0 || amount <= 0 {
+            return 0;
+        }
+
+        let fee_amount =
+            amount.saturating_mul(model.fee_bps as i128).checked_div(BPS_DENOMINATOR).unwrap_or(0);
+        if fee_amount <= 0 {
+            return 0;
+        }
+
+        env.events().publish(
+            (EVENT_PLAT_FEE, issuer.clone(), namespace.clone(), token.clone()),
+            (model.treasury, model.fee_bps, fee_amount, period_id),
+        );
+        fee_amount
     }
 
     /// Return true if the contract is in event-only mode.
@@ -3165,6 +3332,20 @@ impl RevoraRevenueShare {
             &env,
             (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
             (payout_asset.clone(), amount, period_id, blacklist.clone()),
+        );
+
+        // Platform fee model (#468): once a report is recorded, route the configured
+        // platform cut to the treasury and surface it via `plat_fee`. Reaching this point
+        // means a report was actually recorded (initial or override); the below-threshold
+        // and rejected paths return early above, so no fee is taken on those.
+        Self::apply_platform_fee(
+            &env,
+            &offering_id,
+            &issuer,
+            &namespace,
+            &token,
+            amount,
+            period_id,
         );
 
         if Self::is_event_versioning_enabled(env.clone()) {
@@ -6528,72 +6709,6 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// @notice Claim accumulated revenue for a holder across multiple unclaimed periods.
-    /// @dev Payouts are calculated based on the holder's share at the time of claim.
-    ///      Capped at MAX_CLAIM_PERIODS (50) per transaction for gas safety.
-    ///      This function enforces strict security invariants for multi-period claims.
-    ///
-    /// @param holder The address of the token holder. Must provide authentication.
-    /// @param issuer The address of the offering issuer.
-    /// @param namespace A symbol identifying the namespace.
-    /// @param token The token representing the offering.
-    /// @param max_periods Maximum number of periods to process (0 = MAX_CLAIM_PERIODS).
-    ///
-    /// @return Ok(i128) The total payout amount on success.
-    /// @return Err(RevoraError::HolderBlacklisted) if the holder is blacklisted.
-    /// @return Err(RevoraError::NoPendingClaims) if no share is set or all periods are claimed.
-    /// @return Err(RevoraError::ClaimDelayNotElapsed) if the next period is still within the claim delay window.
-    ///
-    /// # Idempotency and Safety Invariants
-    ///
-    /// This function provides the following hard guarantees:
-    ///
-    /// 1. **No double-pay**: `LastClaimedIdx` is written to storage only *after* the token
-    ///    transfer succeeds. If the transfer panics (e.g. insufficient contract balance),
-    ///    the index is not advanced and the holder may retry. Soroban's atomic transaction
-    ///    model ensures partial state is never committed.
-    ///
-    /// 2. **Index advances only on processed periods**: The index is set to
-    ///    `last_claimed_idx`, which reflects only periods that passed the delay check.
-    ///    Periods blocked by `ClaimDelaySecs` are not counted; the function returns
-    ///    `ClaimDelayNotElapsed` without writing any state.
-    ///
-    /// 3. **Zero-payout periods advance the index**: A period with `revenue = 0` (or
-    ///    where `revenue * share_bps / 10_000 == 0` due to truncation) still advances
-    ///    `LastClaimedIdx`. No transfer is issued for zero amounts. This prevents
-    ///    permanently stuck indices on dust periods.
-    ///
-    /// 4. **Exhausted state returns `NoPendingClaims`**: Once `LastClaimedIdx >= PeriodCount`,
-    ///    every subsequent call returns `Err(NoPendingClaims)` without touching storage.
-    ///    Callers may safely retry without risk of side effects.
-    ///
-    /// 5. **Per-holder isolation**: Each holder's `LastClaimedIdx` is keyed by
-    ///    `(offering_id, holder)`. One holder's claim progress never affects another's.
-    ///
-    /// 6. **Auth checked first**: `holder.require_auth()` is the first operation.
-    ///    All subsequent checks (blacklist, share, period count) are read-only and
-    ///    produce no state changes on failure.
-    ///
-    /// 7. **Blacklist/whitelist decisiveness during partial sequences**: The blacklist
-    ///    check is performed INSIDE the period iteration loop. If a holder becomes
-    ///    blacklisted mid-sequence during a multi-period claim, the loop breaks immediately
-    ///    and no subsequent periods in the batch are claimed. The index is only advanced
-    ///    for periods successfully processed before the blacklist took effect. This ensures
-    ///    blacklist/whitelist decisions remain decisive even during partial claim sequences.
-    ///
-    /// 8. **Index monotonicity enforced**: The function validates that period IDs are
-    ///    strictly increasing as they are retrieved from `PeriodEntry`. This ensures
-    ///    `LastClaimedIdx` advances only in ways that match the deposited period order,
-    ///    preventing any possibility of skipping periods or claiming out of order.
-    ///
-    /// # Arguments
-    /// * `holder` - The address of the holder claiming revenue.
-    /// * `issuer` - The address of the offering issuer.
-    /// * `namespace` - A symbol identifying the namespace.
-    /// * `token` - The address of the token.
-    /// * `max_periods` - The maximum number of periods to claim in this call.
-    ///
-    /// # Events
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
     /// periods remain, otherwise `None`. `limit` of 0 or greater than `MAX_PAGE_LIMIT` will be

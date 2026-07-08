@@ -439,17 +439,17 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     let (env, revora_id, revora, _fail_token_id, _fail_token, issuer, offering_token_a, holder) =
         setup_claim_fail();
 
-    // Register a second offering with a fresh non-failing token
+    // Register a second offering backed by a normal (unarmed) token so its claim succeeds.
     let offering_token_b = Address::generate(&env);
-    let admin_b = Address::generate(&env);
+    let (token_b_id, token_b) = deploy_failing_token(&env);
+    token_b.mint(&issuer, &1_000_000);
 
-    let payout_b = Address::generate(&env);
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &payout_b,
+        &token_b_id,
         &0,
         &None,
     );
@@ -461,7 +461,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &payout_b,
+        &token_b_id,
         &100_000,
         &1,
     );
