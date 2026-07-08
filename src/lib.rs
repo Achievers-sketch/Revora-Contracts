@@ -312,6 +312,7 @@ const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
+const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 /// Emitted when a period is sealed by `close_period`.
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
@@ -342,8 +343,9 @@ const EVENT_REDEMPTION_FULFILLED: Symbol = symbol_short!("red_full");
 /// Missing v1 event symbols (referenced by report_revenue versioned path).
 /// Emitted when payment token decimals are set for an offering.
 
-/// Current schema for `EVENT_INDEXED_V2` topics.
-const INDEXER_EVENT_SCHEMA_VERSION: u32 = 2;
+/// Current schema version for indexed events. Bump when adding fields to `EventIndexTopicV*`.
+/// V2 topics continue to emit for backward compatibility during the deprecation window.
+const INDEXER_EVENT_SCHEMA_VERSION: u32 = 3;
 
 const EVENT_CONC_LIMIT_SET: Symbol = symbol_short!("conc_lim");
 const EVENT_ROUNDING_MODE_SET: Symbol = symbol_short!("rnd_mode");
@@ -576,6 +578,23 @@ pub struct EventIndexTopicV2 {
     pub token: Address,
     /// 0 when the event is not period-scoped.
     pub period_id: u64,
+}
+
+/// Versioned structured topic payload for indexers (V3).
+/// Additive fields (e.g. share_class, tax_bucket) land here in future minor versions
+/// without breaking V2 subscribers. V2 and V3 emit concurrently during the deprecation window.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventIndexTopicV3 {
+    pub version: u32,
+    pub event_type: Symbol,
+    pub issuer: Address,
+    pub namespace: Symbol,
+    pub token: Address,
+    /// 0 when the event is not period-scoped.
+    pub period_id: u64,
+    /// Reserved for future use. Facilitates additive schema evolution without struct reshuffle.
+    pub _reserved: u32,
 }
 
 /// Versioned domain-separated payload for off-chain authorized actions.
@@ -1271,6 +1290,20 @@ impl RevoraRevenueShare {
         T: IntoVal<Env, soroban_sdk::Val> + soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>,
     {
         env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
+    }
+
+    /// Dual-emit V2 and V3 indexed events for the same logical payload.
+    /// V2 events are published unchanged at `EVENT_INDEXED_V2` for existing subscribers.
+    /// V3 events are published at `EVENT_INDEXED_V3` with version=3 for forward-compatible indexers.
+    /// Both use `EventIndexTopicV3` internally — the V2 topic still carries version=2 in its event data.
+    fn emit_v2_and_v3(
+        env: &Env,
+        v2_topic: EventIndexTopicV2,
+        v3_topic: EventIndexTopicV3,
+        data: impl IntoVal<Env, soroban_sdk::Val>,
+    ) {
+        env.events().publish((EVENT_INDEXED_V2, v2_topic), &data);
+        env.events().publish((EVENT_INDEXED_V3, v3_topic), &data);
     }
 
     fn is_event_versioning_enabled(_env: Env) -> bool {
@@ -2793,18 +2826,25 @@ impl RevoraRevenueShare {
             (token.clone(), revenue_share_bps, payout_asset.clone()),
         );
 
-        env.events().publish(
-            (
-                EVENT_INDEXED_V2,
-                EventIndexTopicV2 {
-                    version: 2,
-                    event_type: EVENT_TYPE_OFFER,
-                    issuer: issuer.clone(),
-                    namespace: namespace.clone(),
-                    token: token.clone(),
-                    period_id: 0,
-                },
-            ),
+        Self::emit_v2_and_v3(
+            &env,
+            EventIndexTopicV2 {
+                version: 2,
+                event_type: EVENT_TYPE_OFFER,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV3 {
+                version: 3,
+                event_type: EVENT_TYPE_OFFER,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
             (revenue_share_bps, payout_asset.clone()),
         );
 
@@ -3076,18 +3116,25 @@ impl RevoraRevenueShare {
                 ),
                 (payout_asset.clone(), amount, period_id, blacklist.clone()),
             );
-            env.events().publish(
-                (
-                    EVENT_INDEXED_V2,
-                    EventIndexTopicV2 {
-                        version: 2,
-                        event_type: EVENT_TYPE_REV_INIT,
-                        issuer: issuer.clone(),
-                        namespace: namespace.clone(),
-                        token: token.clone(),
-                        period_id,
-                    },
-                ),
+            Self::emit_v2_and_v3(
+                &env,
+                EventIndexTopicV2 {
+                    version: 2,
+                    event_type: EVENT_TYPE_REV_INIT,
+                    issuer: issuer.clone(),
+                    namespace: namespace.clone(),
+                    token: token.clone(),
+                    period_id,
+                },
+                EventIndexTopicV3 {
+                    version: 3,
+                    event_type: EVENT_TYPE_REV_INIT,
+                    issuer: issuer.clone(),
+                    namespace: namespace.clone(),
+                    token: token.clone(),
+                    period_id,
+                    _reserved: 0,
+                },
                 (amount, payout_asset.clone()),
             );
         } else {
@@ -3108,18 +3155,25 @@ impl RevoraRevenueShare {
                             ),
                             (amount, period_id, existing_amount, blacklist.clone()),
                         );
-                        env.events().publish(
-                            (
-                                EVENT_INDEXED_V2,
-                                EventIndexTopicV2 {
-                                    version: 2,
-                                    event_type: EVENT_TYPE_REV_REJ,
-                                    issuer: issuer.clone(),
-                                    namespace: namespace.clone(),
-                                    token: token.clone(),
-                                    period_id,
-                                },
-                            ),
+                        Self::emit_v2_and_v3(
+                            &env,
+                            EventIndexTopicV2 {
+                                version: 2,
+                                event_type: EVENT_TYPE_REV_REJ,
+                                issuer: issuer.clone(),
+                                namespace: namespace.clone(),
+                                token: token.clone(),
+                                period_id,
+                            },
+                            EventIndexTopicV3 {
+                                version: 3,
+                                event_type: EVENT_TYPE_REV_REJ,
+                                issuer: issuer.clone(),
+                                namespace: namespace.clone(),
+                                token: token.clone(),
+                                period_id,
+                                _reserved: 0,
+                            },
                             (amount, existing_amount, payout_asset.clone()),
                         );
                         env.events().publish(
@@ -3160,18 +3214,25 @@ impl RevoraRevenueShare {
                         ),
                         (amount, period_id, existing_amount, blacklist.clone()),
                     );
-                    env.events().publish(
-                        (
-                            EVENT_INDEXED_V2,
-                            EventIndexTopicV2 {
-                                version: 2,
-                                event_type: EVENT_TYPE_REV_OVR,
-                                issuer: issuer.clone(),
-                                namespace: namespace.clone(),
-                                token: token.clone(),
-                                period_id,
-                            },
-                        ),
+                    Self::emit_v2_and_v3(
+                        &env,
+                        EventIndexTopicV2 {
+                            version: 2,
+                            event_type: EVENT_TYPE_REV_OVR,
+                            issuer: issuer.clone(),
+                            namespace: namespace.clone(),
+                            token: token.clone(),
+                            period_id,
+                        },
+                        EventIndexTopicV3 {
+                            version: 3,
+                            event_type: EVENT_TYPE_REV_OVR,
+                            issuer: issuer.clone(),
+                            namespace: namespace.clone(),
+                            token: token.clone(),
+                            period_id,
+                            _reserved: 0,
+                        },
                         (amount, existing_amount, payout_asset.clone()),
                     );
                     env.events().publish(
@@ -3201,18 +3262,25 @@ impl RevoraRevenueShare {
                             ),
                             (amount, period_id),
                         );
-                        env.events().publish(
-                            (
-                                EVENT_INDEXED_V2,
-                                EventIndexTopicV2 {
-                                    version: 2,
-                                    event_type: EVENT_TYPE_REV_OMISS,
-                                    issuer: issuer.clone(),
-                                    namespace: namespace.clone(),
-                                    token: token.clone(),
-                                    period_id,
-                                },
-                            ),
+                        Self::emit_v2_and_v3(
+                            &env,
+                            EventIndexTopicV2 {
+                                version: 2,
+                                event_type: EVENT_TYPE_REV_OMISS,
+                                issuer: issuer.clone(),
+                                namespace: namespace.clone(),
+                                token: token.clone(),
+                                period_id,
+                            },
+                            EventIndexTopicV3 {
+                                version: 3,
+                                event_type: EVENT_TYPE_REV_OMISS,
+                                issuer: issuer.clone(),
+                                namespace: namespace.clone(),
+                                token: token.clone(),
+                                period_id,
+                                _reserved: 0,
+                            },
                             (amount, period_id, payout_asset.clone()),
                         );
                         return Err(RevoraError::MissingReportForOverride);
@@ -3257,18 +3325,25 @@ impl RevoraRevenueShare {
                         ),
                         (amount, period_id, blacklist.clone()),
                     );
-                    env.events().publish(
-                        (
-                            EVENT_INDEXED_V2,
-                            EventIndexTopicV2 {
-                                version: 2,
-                                event_type: EVENT_TYPE_REV_INIT,
-                                issuer: issuer.clone(),
-                                namespace: namespace.clone(),
-                                token: token.clone(),
-                                period_id,
-                            },
-                        ),
+                    Self::emit_v2_and_v3(
+                        &env,
+                        EventIndexTopicV2 {
+                            version: 2,
+                            event_type: EVENT_TYPE_REV_INIT,
+                            issuer: issuer.clone(),
+                            namespace: namespace.clone(),
+                            token: token.clone(),
+                            period_id,
+                        },
+                        EventIndexTopicV3 {
+                            version: 3,
+                            event_type: EVENT_TYPE_REV_INIT,
+                            issuer: issuer.clone(),
+                            namespace: namespace.clone(),
+                            token: token.clone(),
+                            period_id,
+                            _reserved: 0,
+                        },
                         (amount, payout_asset.clone()),
                     );
                     // Versioned v2 event: [2, amount, period_id, blacklist] â€” always emitted (#RC26Q2-C31)
@@ -3295,19 +3370,25 @@ impl RevoraRevenueShare {
             (EVENT_REVENUE_REPORTED, issuer.clone(), namespace.clone(), token.clone()),
             (amount, period_id, blacklist.clone()),
         );
-
-        env.events().publish(
-            (
-                EVENT_INDEXED_V2,
-                EventIndexTopicV2 {
-                    version: 2,
-                    event_type: EVENT_TYPE_REV_REP,
-                    issuer: issuer.clone(),
-                    namespace: namespace.clone(),
-                    token: token.clone(),
-                    period_id,
-                },
-            ),
+        Self::emit_v2_and_v3(
+            &env,
+            EventIndexTopicV2 {
+                version: 2,
+                event_type: EVENT_TYPE_REV_REP,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+            },
+            EventIndexTopicV3 {
+                version: 3,
+                event_type: EVENT_TYPE_REV_REP,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+                _reserved: 0,
+            },
             (amount, payout_asset.clone(), actual_override),
         );
         env.events().publish(
@@ -6206,7 +6287,7 @@ impl RevoraRevenueShare {
         // Advance claim index only for periods actually claimed (respecting delay)
         env.storage().persistent().set(&idx_key, &last_claimed_idx);
 
-        // Versioned v2 event: [2, holder, total_payout, periods] ΓÇö always emitted (#RC26Q2-C31)
+        // Versioned v2 event: [2, holder, total_payout, periods] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
             &env,
             (
@@ -6219,25 +6300,32 @@ impl RevoraRevenueShare {
         );
         env.events().publish(
             (
-                EVENT_CLAIM_V2,
+                EVENT_CLAIM,
                 offering_id.issuer.clone(),
                 offering_id.namespace.clone(),
                 offering_id.token.clone(),
             ),
             (holder, total_payout, claimed_periods),
         );
-        env.events().publish(
-            (
-                EVENT_INDEXED_V2,
-                EventIndexTopicV2 {
-                    version: 2,
-                    event_type: EVENT_TYPE_CLAIM,
-                    issuer: offering_id.issuer,
-                    namespace: offering_id.namespace,
-                    token: offering_id.token,
-                    period_id: 0,
-                },
-            ),
+        Self::emit_v2_and_v3(
+            &env,
+            EventIndexTopicV2 {
+                version: 2,
+                event_type: EVENT_TYPE_CLAIM,
+                issuer: offering_id.issuer.clone(),
+                namespace: offering_id.namespace.clone(),
+                token: offering_id.token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV3 {
+                version: 3,
+                event_type: EVENT_TYPE_CLAIM,
+                issuer: offering_id.issuer,
+                namespace: offering_id.namespace,
+                token: offering_id.token,
+                period_id: 0,
+                _reserved: 0,
+            },
             (total_payout,),
         );
 
@@ -6707,6 +6795,122 @@ impl RevoraRevenueShare {
         let offering_id = OfferingId { issuer, namespace, token };
         let key = DataKey::HolderShare(offering_id, holder);
         env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Configure the reporting access window for an offering.
+    /// If unset, reporting remains always permitted.
+    pub fn set_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        let window = AccessWindow { start_timestamp, end_timestamp };
+        Self::validate_window(&window)?;
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
+        env.events().publish(
+            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
+        Ok(())
+    }
+
+    /// Configure the claiming access window for an offering.
+    /// If unset, claiming remains always permitted.
+    pub fn set_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        let window = AccessWindow { start_timestamp, end_timestamp };
+        Self::validate_window(&window)?;
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage().persistent().set(&WindowDataKey::Claim(offering_id), &window);
+        env.events().publish(
+            (EVENT_CLAIM_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
+        Ok(())
+    }
+
+    /// Read configured reporting window (if any) for an offering.
+    pub fn get_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&WindowDataKey::Report(offering_id))
+    }
+
+    /// Read configured claiming window (if any) for an offering.
+    pub fn get_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&WindowDataKey::Claim(offering_id))
+    }
+
+    /// Return unclaimed period IDs for a holder on an offering.
+    /// Ordering: by deposit index (creation order), deterministic (#38).
+    pub fn get_pending_periods(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> Vec<u64> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let count_key = DataKey::PeriodCount(offering_id.clone());
+        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
+        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+
+        let mut periods = Vec::new(&env);
+        for i in start_idx..period_count {
+            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
+            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
+            if period_id == 0 {
+                continue;
+            }
+            periods.push_back(period_id);
+        }
+        periods
     }
 
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
@@ -8248,5 +8452,178 @@ mod issue_414_supply_cap_tests {
             client.try_deposit_revenue(&issuer, &namespace, &token_addr, &payment_token, &10, &2),
             Err(Ok(RevoraError::SupplyCapExceeded))
         );
+    }
+
+
+    /// Return the current deployed version of the contract state.
+    pub fn get_deployed_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DeployedVersion)
+            .unwrap_or(0)
+    }
+
+    /// Return the current contract version (#23). Used for upgrade compatibility and migration.
+    pub fn get_version(env: Env) -> u32 {
+        let _ = env;
+        CONTRACT_VERSION
+    }
+
+    /// Deterministic fixture payloads for indexer integration tests (#187).
+    ///
+    /// Returns canonical (v2, v3) indexed topic pairs in stable order so indexers can
+    /// validate decoding, routing and storage schemas without replaying full
+    /// contract flows.
+    pub fn get_indexer_fixture_topics(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+    ) -> (Vec<EventIndexTopicV2>, Vec<EventIndexTopicV3>) {
+        let mut v2 = Vec::new(&env);
+        let mut v3 = Vec::new(&env);
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_OFFER,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id: 0,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_OFFER,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id: 0,
+            _reserved: 0,
+        });
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_REV_INIT,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_REV_INIT,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+            _reserved: 0,
+        });
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_REV_OVR,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_REV_OVR,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+            _reserved: 0,
+        });
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_REV_REJ,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_REV_REJ,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+            _reserved: 0,
+        });
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_REV_REP,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_REV_REP,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id,
+            _reserved: 0,
+        });
+
+        v2.push_back(EventIndexTopicV2 {
+            version: 2,
+            event_type: EVENT_TYPE_CLAIM,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id: 0,
+        });
+        v3.push_back(EventIndexTopicV3 {
+            version: 3,
+            event_type: EVENT_TYPE_CLAIM,
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            period_id: 0,
+            _reserved: 0,
+        });
+
+        // Reconciliation event fixtures (admin, fees, limits, meta, multisig)
+        let additional_event_types: &[(u64, Symbol)] = &[
+            (0, EVENT_ADMIN_SET),
+            (0, EVENT_PLATFORM_FEE_SET),
+            (0, symbol_short!("fee_ast")),
+            (0, symbol_short!("fee_off")),
+            (0, EVENT_CONC_LIMIT_SET),
+            (0, EVENT_ROUNDING_MODE_SET),
+            (0, EVENT_META_SIGNER_SET),
+            (0, EVENT_META_DELEGATE_SET),
+            (0, EVENT_MULTISIG_INIT),
+        ];
+        for &(pid, ty) in additional_event_types {
+            v2.push_back(EventIndexTopicV2 {
+                version: 2,
+                event_type: ty,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: pid,
+            });
+            v3.push_back(EventIndexTopicV3 {
+                version: 3,
+                event_type: ty,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: pid,
+                _reserved: 0,
+            });
+        }
+
+        (v2, v3)
     }
 }
