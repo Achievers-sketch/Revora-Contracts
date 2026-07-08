@@ -443,9 +443,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     let offering_token_b = Address::generate(&env);
     let admin_b = Address::generate(&env);
 
-    // Deploy a separate FailingTransferToken instance (no fail_from set = always succeeds)
-    let (payout_b, token_b_client) = deploy_failing_token(&env);
-    token_b_client.mint(&issuer, &200_000);
+    let payout_b = Address::generate(&env);
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
