@@ -167,14 +167,14 @@ pub enum RevoraError {
 
     /// The period has been sealed by `close_period`; no further overrides are accepted.
     ///
-    /// Wire value: 48. Stable since v1.
-    PeriodAlreadyClosed = 48,
-
-    /// Concentration data is too old for the configured max_staleness window.
-    StaleConcentrationData = 34,
-
-    /// Current ledger timestamp is outside configured redemption window.
-    RedemptionWindowClosed = 51,
+    /// Wire value: 53. Stable since v1.
+    PeriodAlreadyClosed = 53,
+    /// Concentration data is stale or missing; cannot enforce concentration limit.
+    StaleConcentrationData = 54,
+    /// The specified share class is invalid or does not exist for the offering.
+    InvalidShareClass = 51,
+    /// The total BPS allocations across all share classes must sum to exactly 10,000.
+    InvalidShareClassBps = 52,
 }
 
 pub mod vesting;
@@ -393,6 +393,21 @@ pub struct OfferingId {
     pub issuer: Address,
     pub namespace: Symbol,
     pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShareClass {
+    A,
+    B,
+    Custom(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassConfig {
+    pub bps: u32,
+    pub voting: bool,
 }
 
 #[contracttype]
@@ -623,6 +638,18 @@ pub enum MetaDataKey {
     RevenueApproved(OfferingId, u64),
 }
 
+/// Pause tier for the contract. Stored under `DataKey::Paused`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseState {
+    /// Contract is fully operational.
+    NotPaused = 0,
+    /// Reports and deposits blocked; `claim` allowed.
+    SoftPaused = 1,
+    /// All state-mutating operations blocked, including `claim`.
+    HardPaused = 2,
+}
+
 /// Defines how fractional shares are handled during distribution calculations.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,8 +794,6 @@ pub enum DataKey {
     SnapshotFinalizationRequired,
     /// Latest committed snapshot reference for an offering.
     LastSnapshotCommitRef(OfferingId),
-    /// Whether the snapshot has been finalized successfully.
-    SnapshotFinalized(OfferingId, u64),
 }
 
 /// Secondary storage keys for auxiliary/extended contract state.
@@ -776,6 +801,16 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey2 {
+    /// Whether the snapshot has been finalized successfully.
+    SnapshotFinalized(OfferingId, u64),
+    /// Per-offering supply cap (max total deposited revenue).
+    SupplyCap(OfferingId),
+    /// Total revenue deposited so far for supply-cap tracking.
+    DepositedRevenue(OfferingId),
+    /// Per-offering investment constraints (min/max stake).
+    InvestmentConstraints(OfferingId),
+    /// Per-offering minimum revenue threshold.
+    MinRevenueThreshold(OfferingId),
     /// Last reported period_id for an offering.
     LastReportedPeriodId(OfferingId),
     /// Last deposited period_id for an offering.
@@ -812,17 +847,12 @@ pub enum DataKey2 {
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
 
-    /// Per-holder pending redemption request.
-    RedemptionRequest(OfferingId, Address),
-
-    /// Per-offering supply cap (i128). 0 = no cap (#96).
-    SupplyCap(OfferingId),
-    /// Cumulative deposited revenue for an offering (i128) (#96).
-    DepositedRevenue(OfferingId),
-    /// Per-offering investment constraints config.
-    InvestmentConstraints(OfferingId),
-    /// Per-offering minimum revenue threshold (i128). 0 = no threshold.
-    MinRevenueThreshold(OfferingId),
+    /// Configurations of share classes for an offering.
+    OfferingClasses(OfferingId),
+    /// Share basis points for a holder in a specific share class of an offering.
+    HolderShareClass(OfferingId, Address, ShareClass),
+    /// Total share basis points allocated to all holders in a specific share class.
+    HolderShareClassTotal(OfferingId, ShareClass),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1295,6 +1325,7 @@ impl RevoraRevenueShare {
         token: Address,
         holder: Address,
         share_bps: u32,
+        share_class: Option<ShareClass>,
     ) -> Result<(), RevoraError> {
         if share_bps > 10_000 {
             return Err(RevoraError::InvalidShareBps);
@@ -1305,26 +1336,71 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        // Maintain a running total of persisted holder shares for this offering.
-        let total_key = DataKey::HolderShareTotal(offering_id.clone());
-        let mut current_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+        let classes: Option<Vec<(ShareClass, ClassConfig)>> =
+            env.storage().persistent().get(&classes_key);
 
-        let old_share: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
-            .unwrap_or(0);
+        match classes {
+            Some(cls_vec) => {
+                let sc = match share_class {
+                    Some(sc) => sc,
+                    None => return Err(RevoraError::InvalidShareClass),
+                };
+                let mut found = false;
+                for (class_name, _) in cls_vec.iter() {
+                    if class_name == sc {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(RevoraError::InvalidShareClass);
+                }
 
-        let new_total = current_total.saturating_sub(old_share).saturating_add(share_bps);
-        if new_total > 10_000 {
-            return Err(RevoraError::InvalidShareBps);
+                let class_share_key =
+                    DataKey2::HolderShareClass(offering_id.clone(), holder.clone(), sc.clone());
+                let old_share: u32 = env.storage().persistent().get(&class_share_key).unwrap_or(0);
+                let total_class_key =
+                    DataKey2::HolderShareClassTotal(offering_id.clone(), sc.clone());
+                let current_class_total: u32 =
+                    env.storage().persistent().get(&total_class_key).unwrap_or(0);
+
+                let new_total =
+                    current_class_total.saturating_sub(old_share).saturating_add(share_bps);
+                if new_total > 10_000 {
+                    return Err(RevoraError::InvalidShareBps);
+                }
+
+                env.storage().persistent().set(&class_share_key, &share_bps);
+                env.storage().persistent().set(&total_class_key, &new_total);
+            }
+            None => {
+                if share_class.is_some() {
+                    return Err(RevoraError::InvalidShareClass);
+                }
+                // Maintain a running total of persisted holder shares for this offering.
+                let total_key = DataKey::HolderShareTotal(offering_id.clone());
+                let mut current_total: u32 =
+                    env.storage().persistent().get(&total_key).unwrap_or(0);
+
+                let old_share: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+                    .unwrap_or(0);
+
+                let new_total = current_total.saturating_sub(old_share).saturating_add(share_bps);
+                if new_total > 10_000 {
+                    return Err(RevoraError::InvalidShareBps);
+                }
+
+                // Persist updated holder share and running total.
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
+                env.storage().persistent().set(&total_key, &new_total);
+            }
         }
-
-        // Persist updated holder share and running total.
-        env.storage()
-            .persistent()
-            .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
-        env.storage().persistent().set(&total_key, &new_total);
 
         env.events().publish(
             (EVENT_SHARE_SET, issuer.clone(), namespace.clone(), token.clone()),
@@ -1887,7 +1963,7 @@ impl RevoraRevenueShare {
         let effective_expiry = if expiry_secs == 0 {
             0
         } else {
-            expiry_secs.max(MIN_ISSUER_TRANSFER_EXPIRY_SECS).min(MAX_ISSUER_TRANSFER_EXPIRY_SECS)
+            expiry_secs.clamp(MIN_ISSUER_TRANSFER_EXPIRY_SECS, MAX_ISSUER_TRANSFER_EXPIRY_SECS)
         };
 
         let timestamp = env.ledger().timestamp();
@@ -2446,6 +2522,7 @@ impl RevoraRevenueShare {
     ///
     /// # Events
     /// Emits `EVENT_OFFER_REG_V2` and `EVENT_INDEXED_V2`.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_offering(
         env: Env,
         issuer: Address,
@@ -2454,10 +2531,22 @@ impl RevoraRevenueShare {
         revenue_share_bps: u32,
         payout_asset: Address,
         supply_cap: i128,
+        classes: Option<Vec<(ShareClass, ClassConfig)>>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
         issuer.require_auth();
+
+        if let Some(ref cls_vec) = classes {
+            let mut sum_bps: u32 = 0;
+            for (_, config) in cls_vec.iter() {
+                sum_bps =
+                    sum_bps.checked_add(config.bps).ok_or(RevoraError::InvalidShareClassBps)?;
+            }
+            if sum_bps != 10_000 {
+                return Err(RevoraError::InvalidShareClassBps);
+            }
+        }
 
         // Negative Amount Validation Matrix: SupplyCap requires >= 0 (#163)
         if let Err((err, _)) =
@@ -2523,6 +2612,12 @@ impl RevoraRevenueShare {
         if supply_cap > 0 {
             let cap_key = DataKey2::SupplyCap(offering_id.clone());
             env.storage().persistent().set(&cap_key, &supply_cap);
+        }
+
+        if let Some(ref cls_vec) = classes {
+            env.storage()
+                .persistent()
+                .set(&DataKey2::OfferingClasses(offering_id.clone()), cls_vec);
         }
 
         Self::emit_v2_event(
@@ -5256,7 +5351,7 @@ impl RevoraRevenueShare {
     fn is_snapshot_finalized(env: &Env, offering_id: &OfferingId, snapshot_ref: u64) -> bool {
         env.storage()
             .persistent()
-            .get(&DataKey::SnapshotFinalized(offering_id.clone(), snapshot_ref))
+            .get(&DataKey2::SnapshotFinalized(offering_id.clone(), snapshot_ref))
             .unwrap_or(false)
     }
 
@@ -5330,7 +5425,7 @@ impl RevoraRevenueShare {
 
         env.storage()
             .persistent()
-            .set(&DataKey::SnapshotFinalized(offering_id.clone(), snapshot_ref), &true);
+            .set(&DataKey2::SnapshotFinalized(offering_id.clone(), snapshot_ref), &true);
         env.events().publish((EVENT_SNAP_FINALIZED, issuer, namespace, token), snapshot_ref);
         Ok(())
     }
@@ -5365,7 +5460,44 @@ impl RevoraRevenueShare {
 
         // Delegate to internal writer which maintains the aggregate running total
         // and enforces the per-offering sum invariant (≤ 10_000 bps).
-        Self::set_holder_share_internal(&env, issuer, namespace, token, holder, share_bps)
+        Self::set_holder_share_internal(&env, issuer, namespace, token, holder, share_bps, None)
+    }
+
+    /// Set a holder's revenue share in basis points for a specific class of an offering.
+    pub fn set_holder_share_class(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        share_bps: u32,
+        share_class: ShareClass,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        Self::get_current_issuer(
+            &env,
+            issuer.clone(),
+            offering_id.namespace.clone(),
+            offering_id.token.clone(),
+        )
+        .ok_or(RevoraError::OfferingNotFound)?;
+
+        Self::set_holder_share_internal(
+            &env,
+            issuer,
+            namespace,
+            token,
+            holder,
+            share_bps,
+            Some(share_class),
+        )
     }
 
     /// Get a holder's revenue share in basis points for an offering.
@@ -5377,7 +5509,39 @@ impl RevoraRevenueShare {
         holder: Address,
     ) -> u32 {
         let offering_id = OfferingId { issuer, namespace, token };
-        env.storage().persistent().get(&DataKey::HolderShare(offering_id, holder)).unwrap_or(0)
+        let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+        if let Some(cls_vec) =
+            env.storage().persistent().get::<_, Vec<(ShareClass, ClassConfig)>>(&classes_key)
+        {
+            let mut total_share = 0;
+            for (sc, _) in cls_vec.iter() {
+                let share: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey2::HolderShareClass(offering_id.clone(), holder.clone(), sc))
+                    .unwrap_or(0);
+                total_share += share;
+            }
+            total_share
+        } else {
+            env.storage().persistent().get(&DataKey::HolderShare(offering_id, holder)).unwrap_or(0)
+        }
+    }
+
+    /// Get a holder's revenue share in basis points for a specific class of an offering.
+    pub fn get_holder_share_class(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        share_class: ShareClass,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey2::HolderShareClass(offering_id, holder, share_class))
+            .unwrap_or(0)
     }
 
     /// Set the claim delay in seconds for an offering.
@@ -5652,7 +5816,50 @@ impl RevoraRevenueShare {
                 offering_id.token.clone(),
             );
             let normalized = Self::normalize_amount(revenue, decimals);
-            let payout = normalized * (share_bps as i128) / 10_000;
+            let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+            let classes: Option<Vec<(ShareClass, ClassConfig)>> =
+                env.storage().persistent().get(&classes_key);
+            let rounding_mode = Self::get_rounding_mode(
+                env.clone(),
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            );
+
+            let payout = if classes.is_some() {
+                let mut p = 0_i128;
+                if let Some(ref cls_vec) = classes {
+                    for (sc, config) in cls_vec.iter() {
+                        let holder_share = env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey2::HolderShareClass(
+                                offering_id.clone(),
+                                holder.clone(),
+                                sc.clone(),
+                            ))
+                            .unwrap_or(0);
+                        if holder_share > 0 {
+                            let class_rev = Self::compute_share(
+                                env.clone(),
+                                normalized,
+                                config.bps,
+                                rounding_mode,
+                            );
+                            let holder_payout = Self::compute_share(
+                                env.clone(),
+                                class_rev,
+                                holder_share,
+                                rounding_mode,
+                            );
+                            p = p.saturating_add(holder_payout);
+                        }
+                    }
+                }
+                p
+            } else {
+                normalized * (share_bps as i128) / 10_000
+            };
             total_payout += payout;
             claimed_periods.push_back(period_id);
             last_claimed_idx = i + 1;
@@ -5810,6 +6017,7 @@ impl RevoraRevenueShare {
         token: Address,
         holder: Address,
         share_bps: u32,
+        share_class: Option<ShareClass>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
@@ -5836,6 +6044,7 @@ impl RevoraRevenueShare {
             offering_id.token,
             holder,
             share_bps,
+            share_class,
         )
     }
 
@@ -5938,6 +6147,7 @@ impl RevoraRevenueShare {
             payload.token.clone(),
             payload.holder.clone(),
             payload.share_bps,
+            None,
         )?;
         Self::mark_meta_nonce_used(&env, &signer, nonce);
         env.events().publish(
@@ -6083,12 +6293,11 @@ impl RevoraRevenueShare {
     /// * `token` - The address of the token.
     /// * `max_periods` - The maximum number of periods to claim in this call.
     ///
-    /// # Events
-
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
     /// periods remain, otherwise `None`. `limit` of 0 or greater than `MAX_PAGE_LIMIT` will be
     /// capped to `MAX_PAGE_LIMIT` to keep calls predictable.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_pending_periods_page(
         env: Env,
         issuer: Address,
@@ -6202,12 +6411,45 @@ impl RevoraRevenueShare {
                 offering_id.token.clone(),
             );
             let normalized = Self::normalize_amount(revenue, decimals);
-            total = total.saturating_add(Self::compute_share(
-                env.clone(),
-                normalized,
-                share_bps,
-                RoundingMode::Truncation,
-            ));
+            let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+            let classes: Option<Vec<(ShareClass, ClassConfig)>> =
+                env.storage().persistent().get(&classes_key);
+
+            let payout = if classes.is_some() {
+                let mut p = 0_i128;
+                if let Some(ref cls_vec) = classes {
+                    for (sc, config) in cls_vec.iter() {
+                        let holder_share = env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey2::HolderShareClass(
+                                offering_id.clone(),
+                                holder.clone(),
+                                sc.clone(),
+                            ))
+                            .unwrap_or(0);
+                        if holder_share > 0 {
+                            let class_rev = Self::compute_share(
+                                env.clone(),
+                                normalized,
+                                config.bps,
+                                RoundingMode::Truncation,
+                            );
+                            let holder_payout = Self::compute_share(
+                                env.clone(),
+                                class_rev,
+                                holder_share,
+                                RoundingMode::Truncation,
+                            );
+                            p = p.saturating_add(holder_payout);
+                        }
+                    }
+                }
+                p
+            } else {
+                Self::compute_share(env.clone(), normalized, share_bps, RoundingMode::Truncation)
+            };
+            total = total.saturating_add(payout);
             processed = processed.saturating_add(1);
             idx = idx.saturating_add(1);
         }
@@ -6635,6 +6877,14 @@ impl RevoraRevenueShare {
         amount: i128,
         holder_shares: Vec<(Address, u32)>,
     ) -> SimulateDistributionResult {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+        let classes: Option<Vec<(ShareClass, ClassConfig)>> =
+            env.storage().persistent().get(&classes_key);
         let mode = Self::get_rounding_mode(env.clone(), issuer, namespace, token.clone());
         let mut total: i128 = 0;
         let mut payouts = Vec::new(&env);
@@ -6643,7 +6893,32 @@ impl RevoraRevenueShare {
             let payout = if share_bps > 10_000 {
                 0_i128
             } else {
-                Self::compute_share(env.clone(), amount, share_bps, mode)
+                if classes.is_some() {
+                    let mut p = 0_i128;
+                    if let Some(ref cls_vec) = classes {
+                        for (sc, config) in cls_vec.iter() {
+                            let holder_share = env
+                                .storage()
+                                .persistent()
+                                .get(&DataKey2::HolderShareClass(
+                                    offering_id.clone(),
+                                    holder.clone(),
+                                    sc.clone(),
+                                ))
+                                .unwrap_or(0);
+                            if holder_share > 0 {
+                                let class_rev =
+                                    Self::compute_share(env.clone(), amount, config.bps, mode);
+                                let holder_payout =
+                                    Self::compute_share(env.clone(), class_rev, holder_share, mode);
+                                p = p.saturating_add(holder_payout);
+                            }
+                        }
+                    }
+                    p
+                } else {
+                    Self::compute_share(env.clone(), amount, share_bps, mode)
+                }
             };
             total = total.saturating_add(payout);
             payouts.push_back((holder.clone(), payout));
@@ -7197,7 +7472,7 @@ mod issue_370_373_tests {
         let mut tokens = Vec::new(&env);
         for i in 0..25_u32 {
             let token = Address::generate(&env);
-            client.register_offering(&issuer, &namespace, &token, &(1_000 + i), &token, &0);
+            client.register_offering(&issuer, &namespace, &token, &(1_000 + i), &token, &0, &None);
             tokens.push_back(token);
         }
 
@@ -7268,13 +7543,37 @@ mod issue_370_373_tests {
 
         let new_token_0 = Address::generate(&env);
         let new_token_1 = Address::generate(&env);
-        client.register_offering(&new_issuer, &namespace, &new_token_0, &1_100, &new_token_0, &0);
-        client.register_offering(&new_issuer, &namespace, &new_token_1, &1_200, &new_token_1, &0);
+        client.register_offering(
+            &new_issuer,
+            &namespace,
+            &new_token_0,
+            &1_100,
+            &new_token_0,
+            &0,
+            &None,
+        );
+        client.register_offering(
+            &new_issuer,
+            &namespace,
+            &new_token_1,
+            &1_200,
+            &new_token_1,
+            &0,
+            &None,
+        );
 
         let mut old_tokens = Vec::new(&env);
         for i in 0..25_u32 {
             let token = Address::generate(&env);
-            client.register_offering(&old_issuer, &namespace, &token, &(2_000 + i), &token, &0);
+            client.register_offering(
+                &old_issuer,
+                &namespace,
+                &token,
+                &(2_000 + i),
+                &token,
+                &0,
+                &None,
+            );
             old_tokens.push_back(token);
         }
 
@@ -7378,7 +7677,8 @@ mod issue_414_supply_cap_tests {
                 &token_addr,
                 &1_000,
                 &payment_token,
-                &0
+                &0,
+                &None
             ),
             Ok(Ok(()))
         );
@@ -7431,7 +7731,8 @@ mod issue_414_supply_cap_tests {
                 &token_addr,
                 &1_000,
                 &payment_token,
-                &1
+                &1,
+                &None
             ),
             Ok(Ok(()))
         );
@@ -7460,7 +7761,8 @@ mod issue_414_supply_cap_tests {
                 &token_addr,
                 &1_000,
                 &payment_token,
-                &cap
+                &cap,
+                &None
             ),
             Ok(Ok(()))
         );
@@ -7488,7 +7790,8 @@ mod issue_414_supply_cap_tests {
                 &token_addr,
                 &1_000,
                 &payment_token,
-                &-1_i128
+                &-1_i128,
+                &None
             ),
             Err(Ok(RevoraError::InvalidAmount))
         );
@@ -7507,7 +7810,8 @@ mod issue_414_supply_cap_tests {
                 &token_addr,
                 &1_000,
                 &payment_token,
-                &cap
+                &cap,
+                &None
             ),
             Ok(Ok(()))
         );

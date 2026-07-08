@@ -181,16 +181,16 @@ fn pending_periods(
     holder: &Address,
 ) -> soroban_sdk::Vec<u64> {
     env.as_contract(revora_id, || {
-        let (periods, _) = RevoraRevenueShare::get_pending_periods_page(
+        RevoraRevenueShare::get_pending_periods_page(
             env.clone(),
             issuer.clone(),
             symbol_short!("def"),
             offering_token.clone(),
             holder.clone(),
             0,
-            u32::MAX,
-        );
-        periods
+            50,
+        )
+        .0
     })
 }
 
@@ -229,6 +229,7 @@ fn setup_claim_fail() -> (
         &10_000,
         &fail_token_id,
         &0,
+        &None,
     );
     revora.set_holder_share(&issuer, &symbol_short!("def"), &offering_token, &holder, &10_000);
 
@@ -440,16 +441,19 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
 
     // Register a second offering with a normal Stellar asset token as payout.
     let offering_token_b = Address::generate(&env);
-    let normal_token_admin = Address::generate(&env);
-    let normal_token = env.register_stellar_asset_contract_v2(normal_token_admin.clone());
+    let admin_b = Address::generate(&env);
+    let payment_token_b = env.register_stellar_asset_contract_v2(admin_b.clone());
+    let payment_token_admin = token::StellarAssetClient::new(&env, &payment_token_b.address());
+    payment_token_admin.mint(&issuer, &100_000);
 
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &normal_token.address(),
+        &payment_token_b.address(),
         &0,
+        &None,
     );
     revora.set_holder_share(&issuer, &symbol_short!("def"), &offering_token_b, &holder, &10_000);
     // Mint and deposit so offering B has claimable revenue.
@@ -459,8 +463,8 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &normal_token.address(),
-        &500_000,
+        &payment_token_b.address(),
+        &100_000,
         &1,
     );
 
