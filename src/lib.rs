@@ -187,18 +187,13 @@ pub enum RevoraError {
     /// The period has been sealed by `close_period`; no further overrides are accepted.
     ///
     /// Wire value: 48. Stable since v1.
-    PeriodAlreadyClosed = 53,
-    /// No FX oracle is configured for a cross-currency revenue report.
-    OracleNotConfigured = 51,
-    /// The configured FX oracle quote is older than the offering's maximum allowed age.
-    OracleQuoteStale = 52,
-    /// Concentration data is stale or missing; fresh report required.
-    StaleConcentrationData = 54,
-}
+    PeriodAlreadyClosed = 48,
 
-#[contractclient(name = "FxOracleClient")]
-pub trait FxOracle {
-    fn quote(env: Env, from: Symbol, to: Symbol) -> (i128, u64);
+    /// Unfreeze reason did not match original freeze reason.
+    FreezeReasonMismatch = 51,
+
+    /// Holder is emergency frozen for this offering.
+    HolderFrozen = 52,
 }
 
 pub mod vesting;
@@ -393,10 +388,8 @@ const EVENT_CONC_LIMIT_SET: Symbol = symbol_short!("conc_lim");
 const EVENT_ROUNDING_MODE_SET: Symbol = symbol_short!("rnd_mode");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("admin_set");
 const EVENT_PLATFORM_FEE_SET: Symbol = symbol_short!("fee_set");
-/// Emitted by `set_offering_platform_fee` when a per-offering fee model is configured (#468).
-const EVENT_PLAT_FEE_SET: Symbol = symbol_short!("pfee_set");
-/// Emitted by `report_revenue` when a non-zero platform fee is routed to the treasury (#468).
-const EVENT_PLAT_FEE: Symbol = symbol_short!("plat_fee");
+const EVENT_FRZ_SET: Symbol = symbol_short!("frz_set");
+const EVENT_FRZ_CLR: Symbol = symbol_short!("frz_clr");
 const BPS_DENOMINATOR: i128 = 10_000;
 const ACCRUAL_SCALE_E18: i128 = 1_000_000_000_000_000_000;
 /// Stellar network canonical decimal precision (7 decimal places, i.e., stroops).
@@ -443,6 +436,15 @@ pub const STORAGE_LAYOUT_VERSION: u32 = 2;
 pub struct TenantId {
     pub issuer: Address,
     pub namespace: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq, Copy)]
+pub enum FreezeReason {
+    Sanctions,
+    CourtOrder,
+    IssuerDispute,
+    Manual,
 }
 
 #[contracttype]
@@ -1024,20 +1026,8 @@ pub enum DataKey2 {
 
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
-    /// Per-offering FX oracle configuration for cross-currency revenue reports.
-    FxOracleConfig(OfferingId),
-
-    /// Multisig keys
-    MultisigThreshold,
-    MultisigOwners,
-    MultisigProposal(u32),
-    MultisigProposalCount,
-    MultisigProposalDuration,
-
-    InvestmentConstraints(OfferingId),
-    SupplyCap(OfferingId),
-    MinRevenueThreshold(OfferingId),
-    DepositedRevenue(OfferingId),
+    /// Emergency holder freeze for an offering.
+    EmergencyFreeze(OfferingId, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1398,6 +1388,28 @@ impl RevoraRevenueShare {
             return Err(RevoraError::NotAuthorized);
         }
         Ok(())
+    }
+
+    /// Check if a holder is emergency frozen for an offering.
+    fn is_frozen(env: &Env, offering_id: &OfferingId, holder: &Address) -> bool {
+        env.storage().persistent().get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(offering_id.clone(), holder.clone())).is_some()
+    }
+
+    /// Require that a holder is not emergency frozen.
+    fn require_not_frozen(env: &Env, offering_id: &OfferingId, holder: &Address) -> Result<(), RevoraError> {
+        if Self::is_frozen(env, offering_id, holder) {
+            return Err(RevoraError::HolderFrozen);
+        }
+        Ok(())
+    }
+
+    /// Require that caller is either admin or issuer of the offering.
+    fn require_admin_or_issuer(env: &Env, caller: &Address, offering_id: &OfferingId) -> Result<(), RevoraError> {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller == &admin || caller == &offering_id.issuer {
+            return Ok(());
+        }
+        Err(RevoraError::NotAuthorized)
     }
 
     /// Return the effective fee bps for (offering, asset): offering override > platform asset > platform global.
@@ -7294,7 +7306,7 @@ impl RevoraRevenueShare {
 
         let offering_id = OfferingId { issuer, namespace, token };
 
-        // Initial blacklist check for early fail-fast
+        // Initial blacklist and freeze checks for early fail-fast
         if Self::is_blacklisted(
             env.clone(),
             offering_id.issuer.clone(),
@@ -7304,6 +7316,7 @@ impl RevoraRevenueShare {
         ) {
             return Err(RevoraError::HolderBlacklisted);
         }
+        Self::require_not_frozen(&env, &offering_id, &holder)?;
 
         let share_bps = Self::get_holder_share(
             env.clone(),
@@ -7345,8 +7358,8 @@ impl RevoraRevenueShare {
         let mut previous_period_id: Option<u64> = None;
 
         for i in start_idx..end_idx {
-            // Enforce blacklist/whitelist decisiveness during partial claim sequences
-            // This ensures that if a holder becomes blacklisted mid-sequence, subsequent
+            // Enforce blacklist/whitelist and freeze decisiveness during partial claim sequences
+            // This ensures that if a holder becomes blacklisted or frozen mid-sequence, subsequent
             // periods in the batch are not claimed
             if Self::is_blacklisted(
                 env.clone(),
@@ -7355,6 +7368,9 @@ impl RevoraRevenueShare {
                 offering_id.token.clone(),
                 holder.clone(),
             ) {
+                break;
+            }
+            if Self::is_frozen(&env, &offering_id, &holder) {
                 break;
             }
 
@@ -8697,6 +8713,110 @@ impl RevoraRevenueShare {
     /// Return true if the contract is frozen.
     pub fn is_frozen(env: Env) -> bool {
         env.storage().persistent().get::<DataKey, bool>(&DataKey::Frozen).unwrap_or(false)
+    }
+
+    /// Emergency freeze a holder for an offering.
+    ///
+    /// Authorization boundary:
+    /// - Current issuer for the offering, or
+    /// - Global admin
+    ///
+    /// Security posture:
+    /// - This action is blocked when the whole contract is globally frozen (fail-closed).
+    /// - Claims and transfers are blocked for the holder.
+    pub fn emergency_freeze_holder(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        reason: FreezeReason,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let key = DataKey2::EmergencyFreeze(offering_id, holder.clone());
+        env.storage().persistent().set(&key, &reason);
+        env.events().publish(
+            (EVENT_FRZ_SET, issuer, namespace, token),
+            (caller, holder, reason),
+        );
+        Ok(())
+    }
+
+    /// Emergency unfreeze a holder for an offering.
+    ///
+    /// Authorization boundary matches `emergency_freeze_holder`.
+    ///
+    /// Security posture:
+    /// - Requires the exact same `reason` that was used to freeze the holder.
+    pub fn emergency_unfreeze_holder(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        reason: FreezeReason,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let key = DataKey2::EmergencyFreeze(offering_id, holder.clone());
+        let stored_reason: FreezeReason = env.storage().persistent().get(&key).ok_or(RevoraError::HolderFrozen)?;
+        if stored_reason != reason {
+            return Err(RevoraError::FreezeReasonMismatch);
+        }
+
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (EVENT_FRZ_CLR, issuer, namespace, token),
+            (caller, holder, reason),
+        );
+        Ok(())
+    }
+
+    /// Return true if a holder is emergency frozen for an offering.
+    pub fn is_holder_frozen(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> bool {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(offering_id, holder)).is_some()
     }
 
     // â”€â”€ Multisig admin logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
