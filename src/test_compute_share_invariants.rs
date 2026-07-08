@@ -49,8 +49,6 @@
 #![cfg(test)]
 extern crate std;
 
-extern crate alloc;
-
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
 use alloc::format;
 use soroban_sdk::Env;
@@ -117,7 +115,7 @@ fn truncation_table_driven() {
             result, expected,
             "Truncation: amount={amount}, bps={bps} → expected {expected}, got {result}"
         );
-        assert_bounds(result, amount, &std::format!("Truncation amount={amount} bps={bps}"));
+        assert_bounds(result, amount, "Truncation");
     }
 }
 
@@ -160,7 +158,7 @@ fn round_half_up_table_driven() {
             result, expected,
             "RoundHalfUp: amount={amount}, bps={bps} → expected {expected}, got {result}"
         );
-        assert_bounds(result, amount, &std::format!("RoundHalfUp amount={amount} bps={bps}"));
+        assert_bounds(result, amount, "RoundHalfUp");
     }
 }
 
@@ -318,9 +316,12 @@ fn round_half_up_gte_truncation_for_positive_amounts() {
         for &bps in bps_values {
             let t = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             let r = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
-            assert!(r >= t, "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}");
-            assert_bounds(t, amount, &format!("Truncation amount={amount} bps={bps}"));
-            assert_bounds(r, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
+            assert!(
+                r >= t,
+                "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}"
+            );
+            assert_bounds(t, amount, "Truncation");
+            assert_bounds(r, amount, "RoundHalfUp");
         }
     }
 }
@@ -597,16 +598,8 @@ fn remainder_product_bound_holds_for_all_bps() {
             let result_round = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
 
             // Verify bounds invariant
-            assert_bounds(
-                result_trunc,
-                amount,
-                &std::format!("Truncation amount={amount} bps={bps}"),
-            );
-            assert_bounds(
-                result_round,
-                amount,
-                &std::format!("RoundHalfUp amount={amount} bps={bps}"),
-            );
+            assert_bounds(result_trunc, amount, "Truncation");
+            assert_bounds(result_round, amount, "RoundHalfUp");
 
             // Verify that the result is consistent with the decomposition formula
             // amount = q * 10_000 + r, share = q * bps + (r * bps) / 10_000
@@ -638,7 +631,7 @@ fn checked_mul_defense_in_depth_prevents_overflow() {
         for bps in [1_u32, 5_000, 10_000] {
             let result = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             // Should never panic and should always satisfy bounds
-            assert_bounds(result, amount, &std::format!("Extreme amount={amount} bps={bps}"));
+            assert_bounds(result, amount, "Extreme amount");
         }
     }
 }
