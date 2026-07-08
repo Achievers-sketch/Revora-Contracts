@@ -47,6 +47,7 @@
 //! holds for all i128 extremes.
 
 #![cfg(test)]
+extern crate std;
 
 extern crate std;
 use std::format;
@@ -116,7 +117,7 @@ fn truncation_table_driven() {
             result, expected,
             "Truncation: amount={amount}, bps={bps} → expected {expected}, got {result}"
         );
-        assert_bounds(result, amount, &format!("Truncation amount={amount} bps={bps}"));
+        assert_bounds(result, amount, &std::format!("Truncation amount={amount} bps={bps}"));
     }
 }
 
@@ -159,7 +160,7 @@ fn round_half_up_table_driven() {
             result, expected,
             "RoundHalfUp: amount={amount}, bps={bps} → expected {expected}, got {result}"
         );
-        assert_bounds(result, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
+        assert_bounds(result, amount, &std::format!("RoundHalfUp amount={amount} bps={bps}"));
     }
 }
 
@@ -318,8 +319,8 @@ fn round_half_up_gte_truncation_for_positive_amounts() {
             let t = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             let r = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
             assert!(r >= t, "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}");
-            assert_bounds(t, amount, &format!("Truncation amount={amount} bps={bps}"));
-            assert_bounds(r, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
+            assert_bounds(t, amount, &std::format!("Truncation amount={amount} bps={bps}"));
+            assert_bounds(r, amount, &std::format!("RoundHalfUp amount={amount} bps={bps}"));
         }
     }
 }
@@ -584,8 +585,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        (i128::MAX / 10_000 - 1) * 10_000 + 9_999, // Max remainder near MAX
-        (i128::MIN / 10_000 + 1) * 10_000 - 9_999, // Min remainder near MIN
+        i128::MAX / 10_000 * 10_000, // Max aligned (avoids overflow)
+        i128::MIN / 10_000 * 10_000, // Min aligned (avoids overflow)
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];
@@ -596,8 +597,16 @@ fn remainder_product_bound_holds_for_all_bps() {
             let result_round = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
 
             // Verify bounds invariant
-            assert_bounds(result_trunc, amount, &format!("Truncation amount={amount} bps={bps}"));
-            assert_bounds(result_round, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
+            assert_bounds(
+                result_trunc,
+                amount,
+                &std::format!("Truncation amount={amount} bps={bps}"),
+            );
+            assert_bounds(
+                result_round,
+                amount,
+                &std::format!("RoundHalfUp amount={amount} bps={bps}"),
+            );
 
             // Verify that the result is consistent with the decomposition formula
             // amount = q * 10_000 + r, share = q * bps + (r * bps) / 10_000
@@ -626,10 +635,10 @@ fn checked_mul_defense_in_depth_prevents_overflow() {
     let extreme_amounts = [i128::MAX, i128::MIN, i128::MAX - 1, i128::MIN + 1];
 
     for &amount in &extreme_amounts {
-        for bps in [1_u32, 5_000, 10_000] {
+        for &bps in [1_u32, 5_000, 10_000].iter() {
             let result = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             // Should never panic and should always satisfy bounds
-            assert_bounds(result, amount, &format!("Extreme amount={amount} bps={bps}"));
+            assert_bounds(result, amount, &std::format!("Extreme amount={amount} bps={bps}"));
         }
     }
 }

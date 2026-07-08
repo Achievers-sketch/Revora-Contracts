@@ -41,8 +41,8 @@
 
 use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, testutils::Address as _, Address,
-    Env, String,
+    contract, contractimpl, contracttype, symbol_short, testutils::Address as _, Address, Env,
+    String,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -439,19 +439,19 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     let (env, revora_id, revora, _fail_token_id, _fail_token, issuer, offering_token_a, holder) =
         setup_claim_fail();
 
-    // Register a second offering with a normal Stellar asset token as payout.
+    // Register a second offering with a fresh non-failing token
     let offering_token_b = Address::generate(&env);
     let admin_b = Address::generate(&env);
-    let payment_token_b = env.register_stellar_asset_contract_v2(admin_b.clone());
-    let payment_token_admin = token::StellarAssetClient::new(&env, &payment_token_b.address());
-    payment_token_admin.mint(&issuer, &100_000);
 
+    // Deploy a separate FailingTransferToken instance (no fail_from set = always succeeds)
+    let (payout_b, token_b_client) = deploy_failing_token(&env);
+    token_b_client.mint(&issuer, &200_000);
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &payment_token_b.address(),
+        &payout_b,
         &0,
         &None,
     );
@@ -463,7 +463,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &payment_token_b.address(),
+        &payout_b,
         &100_000,
         &1,
     );
