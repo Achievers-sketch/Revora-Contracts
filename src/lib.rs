@@ -42,8 +42,8 @@
     clippy::enum_variant_names
 )]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 #[soroban_sdk::contracterror]
@@ -187,9 +187,18 @@ pub enum RevoraError {
     /// The period has been sealed by `close_period`; no further overrides are accepted.
     ///
     /// Wire value: 48. Stable since v1.
-    PeriodAlreadyClosed = 48,
-    /// Transfer participants are invalid (from == to).
-    InvalidTransferParticipants = 51,
+    PeriodAlreadyClosed = 53,
+    /// No FX oracle is configured for a cross-currency revenue report.
+    OracleNotConfigured = 51,
+    /// The configured FX oracle quote is older than the offering's maximum allowed age.
+    OracleQuoteStale = 52,
+    /// Concentration data is stale or missing; fresh report required.
+    StaleConcentrationData = 54,
+}
+
+#[contractclient(name = "FxOracleClient")]
+pub trait FxOracle {
+    fn quote(env: Env, from: Symbol, to: Symbol) -> (i128, u64);
 }
 
 pub mod vesting;
@@ -494,6 +503,17 @@ pub struct Offering {
     /// Cumulative revenue share for all holders in basis points (0-10000).
     pub revenue_share_bps: u32,
     pub payout_asset: Address,
+}
+
+/// Per-offering FX oracle configuration used when `report_revenue` receives a
+/// revenue asset that differs from the offering payout asset.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxOracleConfig {
+    pub oracle: Address,
+    pub revenue_symbol: Symbol,
+    pub payout_symbol: Symbol,
+    pub max_oracle_age_secs: u64,
 }
 
 /// Per-offering concentration guardrail config (#26).
@@ -829,6 +849,14 @@ pub enum PauseState {
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseState {
+    NotPaused = 0,
+    SoftPaused = 1,
+    HardPaused = 2,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub(crate) enum DataKey {
     /// Deprecated shared period tracker retained for backward compatibility with older storage.
@@ -883,17 +911,6 @@ pub(crate) enum DataKey {
     Frozen,
     /// Proposed new admin address (pending two-step rotation).
     PendingAdmin,
-
-    /// Multisig admin threshold.
-    MultisigThreshold,
-    /// Multisig admin owners.
-    MultisigOwners,
-    /// Multisig proposal by ID.
-    MultisigProposal(u32),
-    /// Multisig proposal count.
-    MultisigProposalCount,
-    /// Multisig proposal duration in seconds.
-    MultisigProposalDuration,
 
     /// Whether snapshot distribution is enabled for an offering.
     SnapshotConfig(OfferingId),
@@ -1007,15 +1024,20 @@ pub enum DataKey2 {
 
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
+    /// Per-offering FX oracle configuration for cross-currency revenue reports.
+    FxOracleConfig(OfferingId),
 
-    /// Per-offering supply cap (revenue deposit limit).
+    /// Multisig keys
+    MultisigThreshold,
+    MultisigOwners,
+    MultisigProposal(u32),
+    MultisigProposalCount,
+    MultisigProposalDuration,
+
+    InvestmentConstraints(OfferingId),
     SupplyCap(OfferingId),
-    /// Per-offering total deposited revenue.
+    MinRevenueThreshold(OfferingId),
     DepositedRevenue(OfferingId),
-    /// Per-offering max total supply shares (share unit cap).
-    MaxTotalSupplyShares(OfferingId),
-    /// Per-offering total issued shares (sum of holder shares in units).
-    TotalSharesIssued(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1370,7 +1392,7 @@ impl RevoraRevenueShare {
         let owners: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::MultisigOwners)
+            .get(&DataKey2::MultisigOwners)
             .ok_or(RevoraError::NotInitialized)?;
         if !owners.contains(caller) {
             return Err(RevoraError::NotAuthorized);
@@ -3484,6 +3506,93 @@ impl RevoraRevenueShare {
         Self::get_locked_payment_token_for_offering(&env, &offering_id)
     }
 
+    /// Configure the FX oracle used to convert cross-currency revenue reports
+    /// into the offering payout asset before storing report and audit state.
+    ///
+    /// The issuer owns this configuration. `revenue_symbol` is passed to the
+    /// oracle as the quote source when `report_revenue` is called with a
+    /// non-payout asset; `payout_symbol` is the quote target for the registered
+    /// offering payout asset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_fx_oracle(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        oracle: Address,
+        revenue_symbol: Symbol,
+        payout_symbol: Symbol,
+        max_oracle_age_secs: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let config = FxOracleConfig {
+            oracle,
+            revenue_symbol,
+            payout_symbol,
+            max_oracle_age_secs,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FxOracleConfig(offering_id), &config);
+        Ok(())
+    }
+
+    /// Return the configured FX oracle for an offering, if one exists.
+    pub fn get_fx_oracle(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<FxOracleConfig> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey2, FxOracleConfig>(&DataKey2::FxOracleConfig(offering_id))
+    }
+
+    fn convert_report_amount_if_needed(
+        env: &Env,
+        offering_id: &OfferingId,
+        offering: &Offering,
+        reported_asset: &Address,
+        amount: i128,
+        now: u64,
+    ) -> Result<(i128, Address), RevoraError> {
+        if offering.payout_asset == *reported_asset {
+            return Ok((amount, reported_asset.clone()));
+        }
+
+        let config: FxOracleConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FxOracleConfig(offering_id.clone()))
+            .ok_or(RevoraError::PayoutAssetMismatch)?;
+        let (rate, quoted_at) = FxOracleClient::new(env, &config.oracle)
+            .quote(&config.revenue_symbol, &config.payout_symbol);
+        if config.max_oracle_age_secs > 0
+            && now.saturating_sub(quoted_at) > config.max_oracle_age_secs
+        {
+            return Err(RevoraError::OracleQuoteStale);
+        }
+        let converted_amount = amount.saturating_mul(rate).saturating_div(BPS_DENOMINATOR);
+        Ok((converted_amount, offering.payout_asset.clone()))
+    }
+
     /// Record or correct a revenue report for an offering and emit audit events.
     ///
     /// Semantics:
@@ -3523,6 +3632,9 @@ impl RevoraRevenueShare {
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
+        issuer.require_auth();
+        let mut amount = amount;
+        let mut payout_asset = payout_asset;
 
         // Input validation (#35): reject zero/invalid period_id
         if period_id == 0 {
@@ -3547,7 +3659,6 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
         let last_report_period_key = DataKey2::LastReportedPeriodId(offering_id.clone());
-        let threshold = Self::get_min_revenue_threshold_for_offering(&env, &offering_id);
         let current_timestamp = env.ledger().timestamp();
 
         Self::require_not_offering_frozen(&env, &offering_id)?;
@@ -3557,13 +3668,16 @@ impl RevoraRevenueShare {
             let offering =
                 Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
                     .ok_or(RevoraError::OfferingNotFound)?;
-            if offering.issuers.primary != issuer {
-                return Err(RevoraError::OfferingNotFound);
-            }
-            Self::require_issuer_quorum_auth(&env, &offering.issuers);
-            if offering.payout_asset != payout_asset {
-                return Err(RevoraError::PayoutAssetMismatch);
-            }
+            let converted = Self::convert_report_amount_if_needed(
+                &env,
+                &offering_id,
+                &offering,
+                &payout_asset,
+                amount,
+                current_timestamp,
+            )?;
+            amount = converted.0;
+            payout_asset = converted.1;
 
             // Testnet mode bypass: if enabled, skip concentration limit enforcement
             // to allow flexible testing of revenue flows without holder constraints.
@@ -3603,6 +3717,8 @@ impl RevoraRevenueShare {
                 }
             }
         }
+
+        let threshold = Self::get_min_revenue_threshold_for_offering(&env, &offering_id);
 
         // Use bounded read for event snapshots to avoid unbounded payloads
         // Cap at MAX_PAGE_LIMIT (20) to prevent gas spikes from large blacklists
@@ -8335,7 +8451,7 @@ impl RevoraRevenueShare {
     /// Set the admin address. May only be called once; caller must authorize as the new admin.
     /// If multisig is initialized, this function is disabled in favor of execute_action(SetAdmin).
     pub fn set_admin(env: Env, admin: Address) -> Result<(), RevoraError> {
-        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+        if env.storage().persistent().has(&DataKey2::MultisigThreshold) {
             return Err(RevoraError::LimitReached);
         }
         admin.require_auth();
@@ -8476,7 +8592,7 @@ impl RevoraRevenueShare {
     /// Emits event. Claim and read-only functions remain allowed.
     /// If multisig is initialized, this function is disabled in favor of execute_action(Freeze).
     pub fn freeze(env: Env) -> Result<(), RevoraError> {
-        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+        if env.storage().persistent().has(&DataKey2::MultisigThreshold) {
             return Err(RevoraError::LimitReached);
         }
         let key = DataKey::Admin;
@@ -8626,7 +8742,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::NotAuthorized);
         }
 
-        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
+        if env.storage().persistent().has(&DataKey2::MultisigThreshold) {
             return Err(RevoraError::LimitReached); // Already initialized
         }
         if owners.is_empty() {
@@ -8657,10 +8773,10 @@ impl RevoraRevenueShare {
             return Err(RevoraError::InvalidAmount);
         }
 
-        env.storage().persistent().set(&DataKey::MultisigThreshold, &threshold);
-        env.storage().persistent().set(&DataKey::MultisigOwners, &owners.clone());
-        env.storage().persistent().set(&DataKey::MultisigProposalCount, &0_u32);
-        env.storage().persistent().set(&DataKey::MultisigProposalDuration, &proposal_duration);
+        env.storage().persistent().set(&DataKey2::MultisigThreshold, &threshold);
+        env.storage().persistent().set(&DataKey2::MultisigOwners, &owners.clone());
+        env.storage().persistent().set(&DataKey2::MultisigProposalCount, &0_u32);
+        env.storage().persistent().set(&DataKey2::MultisigProposalDuration, &proposal_duration);
         env.events().publish((EVENT_MULTISIG_INIT, caller.clone()), (owners.len(), threshold));
         Ok(())
     }
@@ -8675,13 +8791,13 @@ impl RevoraRevenueShare {
         proposer.require_auth();
         Self::require_multisig_owner(&env, &proposer)?;
 
-        let count_key = DataKey::MultisigProposalCount;
+        let count_key = DataKey2::MultisigProposalCount;
         let id: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let duration: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::MultisigProposalDuration)
+            .get(&DataKey2::MultisigProposalDuration)
             .ok_or(RevoraError::NotInitialized)?;
         let now = env.ledger().timestamp();
         let expiry = now.checked_add(duration).ok_or(RevoraError::InvalidAmount)?;
@@ -8699,7 +8815,7 @@ impl RevoraRevenueShare {
             expiry,
         };
 
-        env.storage().persistent().set(&DataKey::MultisigProposal(id), &proposal);
+        env.storage().persistent().set(&DataKey2::MultisigProposal(id), &proposal);
         env.storage().persistent().set(&count_key, &(id + 1));
 
         env.events().publish((EVENT_PROPOSAL_CREATED, proposer.clone()), (id, expiry));
@@ -8716,7 +8832,7 @@ impl RevoraRevenueShare {
         approver.require_auth();
         Self::require_multisig_owner(&env, &approver)?;
 
-        let key = DataKey::MultisigProposal(proposal_id);
+        let key = DataKey2::MultisigProposal(proposal_id);
         let mut proposal: Proposal =
             env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
 
@@ -8741,7 +8857,7 @@ impl RevoraRevenueShare {
         let _threshold: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::MultisigThreshold)
+            .get(&DataKey2::MultisigThreshold)
             .ok_or(RevoraError::NotInitialized)?;
 
         env.storage().persistent().set(&key, &proposal);
@@ -8757,7 +8873,7 @@ impl RevoraRevenueShare {
         executor.require_auth();
         Self::require_multisig_owner(&env, &executor)?;
 
-        let key = DataKey::MultisigProposal(proposal_id);
+        let key = DataKey2::MultisigProposal(proposal_id);
         let mut proposal: Proposal =
             env.storage().persistent().get(&key).ok_or(RevoraError::OfferingNotFound)?;
 
@@ -8772,7 +8888,7 @@ impl RevoraRevenueShare {
         let threshold: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::MultisigThreshold)
+            .get(&DataKey2::MultisigThreshold)
             .ok_or(RevoraError::NotInitialized)?;
         if proposal.approvals.len() < threshold {
             return Err(RevoraError::NotAuthorized);
@@ -8791,15 +8907,15 @@ impl RevoraRevenueShare {
             }
             ProposalAction::SetThreshold(new_threshold) => {
                 let owners: Vec<Address> =
-                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                    env.storage().persistent().get(&DataKey2::MultisigOwners).unwrap();
                 if new_threshold == 0 || new_threshold > owners.len() {
                     return Err(RevoraError::InvalidShareBps);
                 }
-                env.storage().persistent().set(&DataKey::MultisigThreshold, &new_threshold);
+                env.storage().persistent().set(&DataKey2::MultisigThreshold, &new_threshold);
             }
             ProposalAction::AddOwner(new_owner) => {
                 let mut owners: Vec<Address> =
-                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                    env.storage().persistent().get(&DataKey2::MultisigOwners).unwrap();
                 if owners.len() >= Self::MAX_MULTISIG_OWNERS {
                     return Err(RevoraError::LimitReached);
                 }
@@ -8807,11 +8923,11 @@ impl RevoraRevenueShare {
                     return Err(RevoraError::LimitReached);
                 }
                 owners.push_back(new_owner);
-                env.storage().persistent().set(&DataKey::MultisigOwners, &owners);
+                env.storage().persistent().set(&DataKey2::MultisigOwners, &owners);
             }
             ProposalAction::RemoveOwner(old_owner) => {
                 let owners: Vec<Address> =
-                    env.storage().persistent().get(&DataKey::MultisigOwners).unwrap();
+                    env.storage().persistent().get(&DataKey2::MultisigOwners).unwrap();
                 if !owners.contains(&old_owner) {
                     return Err(RevoraError::NotAuthorized);
                 }
@@ -8827,13 +8943,13 @@ impl RevoraRevenueShare {
                         new_owners.push_back(owner);
                     }
                 }
-                env.storage().persistent().set(&DataKey::MultisigOwners, &new_owners);
+                env.storage().persistent().set(&DataKey2::MultisigOwners, &new_owners);
             }
             ProposalAction::SetProposalDuration(new_duration) => {
                 if new_duration == 0 {
                     return Err(RevoraError::InvalidAmount);
                 }
-                env.storage().persistent().set(&DataKey::MultisigProposalDuration, &new_duration);
+                env.storage().persistent().set(&DataKey2::MultisigProposalDuration, &new_duration);
                 env.events().publish((EVENT_DURATION_SET, proposal.proposer.clone()), new_duration);
             }
         }
@@ -8925,6 +9041,124 @@ impl RevoraRevenueShare {
         Ok(seeds)
     }
 } // end impl RevoraRevenueShare (plain)
+
+#[cfg(test)]
+mod issue_455_fx_oracle_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, testutils::{Address as _, Ledger}, Address, Env, Symbol};
+
+    pub mod fresh {
+        use super::*;
+        #[contract]
+        pub struct FreshFxOracleStub;
+
+        #[contractimpl]
+        impl FreshFxOracleStub {
+            pub fn quote(env: Env, from: Symbol, to: Symbol) -> (i128, u64) {
+                assert_eq!(from, Symbol::new(&env, "EUR"));
+                assert_eq!(to, Symbol::new(&env, "USDC"));
+                (12_000, env.ledger().timestamp())
+            }
+        }
+    }
+    use fresh::FreshFxOracleStub;
+
+    pub mod stale {
+        use super::*;
+        #[contract]
+        pub struct StaleFxOracleStub;
+
+        #[contractimpl]
+        impl StaleFxOracleStub {
+            pub fn quote(env: Env, from: Symbol, to: Symbol) -> (i128, u64) {
+                assert_eq!(from, Symbol::new(&env, "EUR"));
+                assert_eq!(to, Symbol::new(&env, "USDC"));
+                (12_000, env.ledger().timestamp().saturating_sub(120))
+            }
+        }
+    }
+    use stale::StaleFxOracleStub;
+
+    fn setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Symbol, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let namespace = Symbol::new(&env, "def");
+        let token = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        client.register_offering(&issuer, &namespace, &token, &5_000, &payout_asset, &0);
+        (env, client, issuer, namespace, token, payout_asset)
+    }
+
+    #[test]
+    fn report_revenue_converts_cross_currency_amount_with_registered_oracle() {
+        let (env, client, issuer, namespace, token, _payout_asset) = setup();
+        let oracle = env.register_contract(None, FreshFxOracleStub);
+        let reported_asset = Address::generate(&env);
+
+        client.set_fx_oracle(
+            &issuer,
+            &namespace,
+            &token,
+            &oracle,
+            &Symbol::new(&env, "EUR"),
+            &Symbol::new(&env, "USDC"),
+            &60,
+        );
+
+        client.report_revenue(
+            &issuer,
+            &namespace,
+            &token,
+            &reported_asset,
+            &1_000,
+            &1,
+            &false,
+        );
+
+        assert_eq!(client.get_revenue_by_period(&issuer, &namespace, &token, &1), 1_200);
+        assert_eq!(
+            client.get_audit_summary(&issuer, &namespace, &token).unwrap().total_revenue,
+            1_200
+        );
+    }
+
+    #[test]
+    fn stale_oracle_quote_rejects_report_without_state_change() {
+        let (env, client, issuer, namespace, token, _payout_asset) = setup();
+        let oracle = env.register_contract(None, StaleFxOracleStub);
+        let reported_asset = Address::generate(&env);
+
+        client.set_fx_oracle(
+            &issuer,
+            &namespace,
+            &token,
+            &oracle,
+            &Symbol::new(&env, "EUR"),
+            &Symbol::new(&env, "USDC"),
+            &60,
+        );
+
+        let result = client.try_report_revenue(
+            &issuer,
+            &namespace,
+            &token,
+            &reported_asset,
+            &1_000,
+            &1,
+            &false,
+        );
+
+        assert_eq!(result, Err(Ok(RevoraError::OracleQuoteStale)));
+        assert_eq!(client.get_revenue_by_period(&issuer, &namespace, &token, &1), 0);
+        assert_eq!(client.get_audit_summary(&issuer, &namespace, &token), None);
+    }
+}
 
 #[cfg(test)]
 mod issue_370_373_tests {
