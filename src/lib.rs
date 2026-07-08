@@ -353,6 +353,8 @@ const EVENT_PLAT_FEE_SET: Symbol = symbol_short!("pfee_set");
 /// Emitted by `report_revenue` when a non-zero platform fee is routed to the treasury (#468).
 const EVENT_PLAT_FEE: Symbol = symbol_short!("plat_fee");
 const BPS_DENOMINATOR: i128 = 10_000;
+/// E18 fixed-point precision.
+const E18: i128 = 1_000_000_000_000_000_000;
 /// Stellar network canonical decimal precision (7 decimal places, i.e., stroops).
 const STELLAR_CANONICAL_DECIMALS: u32 = 7;
 /// Maximum accepted decimal precision (safety cap for normalization math).
@@ -793,8 +795,12 @@ pub(crate) enum DataKey {
     PeriodEntry(OfferingId, u32),
     /// Total number of deposited periods for an offering.
     PeriodCount(OfferingId),
+    /// Per-offering accrual index in e18 fixed-point.
+    AccrualIndexE18(OfferingId),
     /// Holder's share in basis points for (offering_id, holder).
     HolderShare(OfferingId, Address),
+    /// Last accrual index a holder has claimed up to.
+    LastClaimedAccrualIndex(OfferingId, Address),
     /// Per-offering running total of all persisted holder shares (basis points).
     HolderShareTotal(OfferingId),
     /// Next period index to claim for (offering_id, holder).
@@ -916,12 +922,10 @@ pub enum DataKey2 {
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
 
-    /// Whether the snapshot has been finalized successfully.
-    SnapshotFinalized(OfferingId, u64),
-
-    InvestmentConstraints(OfferingId),
+    /// Per-offering supply cap (#96).
     SupplyCap(OfferingId),
-    MinRevenueThreshold(OfferingId),
+    /// Per-offering total deposited revenue (#96).
+    DepositedRevenue(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1515,11 +1519,17 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Persist updated holder share and running total.
+        // Persist updated holder share, running total, and update last claimed accrual index.
         env.storage()
             .persistent()
             .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
         env.storage().persistent().set(&total_key, &new_total);
+        
+        // Update last claimed accrual index to current index to settle existing accrual
+        let current_accrual_key = DataKey::AccrualIndexE18(offering_id.clone());
+        let current_accrual: i128 = env.storage().persistent().get(&current_accrual_key).unwrap_or(0);
+        let last_claimed_accrual_key = DataKey::LastClaimedAccrualIndex(offering_id.clone(), holder.clone());
+        env.storage().persistent().set(&last_claimed_accrual_key, &current_accrual);
 
         env.events().publish(
             (EVENT_SHARE_SET, issuer.clone(), namespace.clone(), token.clone()),
@@ -1661,6 +1671,22 @@ impl RevoraRevenueShare {
                 (EVENT_SUPPLY_CAP_REACHED, issuer.clone(), namespace.clone(), token.clone()),
                 (new_deposited, cap_val),
             );
+        }
+
+        // Update the e18 accrual index
+        let decimals = Self::get_payment_token_decimals(env.clone(), issuer.clone(), namespace.clone(), token.clone());
+        let normalized_amount = Self::normalize_amount(amount, decimals);
+        let total_share_bps_key = DataKey::HolderShareTotal(offering_id.clone());
+        let total_share_bps: u32 = env.storage().persistent().get(&total_share_bps_key).unwrap_or(0);
+        
+        if total_share_bps > 0 {
+            let accrual_delta = (normalized_amount.checked_mul(E18))
+                .and_then(|x| x.checked_div(total_share_bps as i128))
+                .unwrap_or(0);
+            let current_accrual_key = DataKey::AccrualIndexE18(offering_id.clone());
+            let current_accrual: i128 = env.storage().persistent().get(&current_accrual_key).unwrap_or(0);
+            let new_accrual = current_accrual.checked_add(accrual_delta).unwrap_or(current_accrual);
+            env.storage().persistent().set(&current_accrual_key, &new_accrual);
         }
 
         // Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64]
@@ -6306,7 +6332,6 @@ impl RevoraRevenueShare {
         let delay_secs: u64 = env.storage().persistent().get(&delay_key).unwrap_or(0);
         let now = env.ledger().timestamp();
 
-        let mut total_payout: i128 = 0;
         let mut claimed_periods = Vec::new(&env);
         let mut last_claimed_idx = start_idx;
         let mut previous_period_id: Option<u64> = None;
@@ -6344,60 +6369,6 @@ impl RevoraRevenueShare {
             if delay_secs > 0 && now < deposit_time.saturating_add(delay_secs) {
                 break;
             }
-            let rev_key = DataKey::PeriodRevenue(offering_id.clone(), period_id);
-            let revenue: i128 = env.storage().persistent().get(&rev_key).unwrap();
-            let decimals = Self::get_payment_token_decimals(
-                env.clone(),
-                offering_id.issuer.clone(),
-                offering_id.namespace.clone(),
-                offering_id.token.clone(),
-            );
-            let normalized = Self::normalize_amount(revenue, decimals);
-            let classes_key = DataKey2::OfferingClasses(offering_id.clone());
-            let classes: Option<Vec<(ShareClass, ClassConfig)>> =
-                env.storage().persistent().get(&classes_key);
-            let rounding_mode = Self::get_rounding_mode(
-                env.clone(),
-                offering_id.issuer.clone(),
-                offering_id.namespace.clone(),
-                offering_id.token.clone(),
-            );
-
-            let payout = if classes.is_some() {
-                let mut p = 0_i128;
-                if let Some(ref cls_vec) = classes {
-                    for (sc, config) in cls_vec.iter() {
-                        let holder_share = env
-                            .storage()
-                            .persistent()
-                            .get(&DataKey2::HolderShareClass(
-                                offering_id.clone(),
-                                holder.clone(),
-                                sc.clone(),
-                            ))
-                            .unwrap_or(0);
-                        if holder_share > 0 {
-                            let class_rev = Self::compute_share(
-                                env.clone(),
-                                normalized,
-                                config.bps,
-                                rounding_mode,
-                            );
-                            let holder_payout = Self::compute_share(
-                                env.clone(),
-                                class_rev,
-                                holder_share,
-                                rounding_mode,
-                            );
-                            p = p.saturating_add(holder_payout);
-                        }
-                    }
-                }
-                p
-            } else {
-                normalized * (share_bps as i128) / 10_000
-            };
-            total_payout += payout;
             claimed_periods.push_back(period_id);
             last_claimed_idx = i + 1;
         }
@@ -6405,6 +6376,18 @@ impl RevoraRevenueShare {
         if last_claimed_idx == start_idx {
             return Err(RevoraError::ClaimDelayNotElapsed);
         }
+
+        // Calculate total payout using e18 accrual index
+        let current_accrual_key = DataKey::AccrualIndexE18(offering_id.clone());
+        let current_accrual: i128 = env.storage().persistent().get(&current_accrual_key).unwrap_or(0);
+        let last_claimed_accrual_key = DataKey::LastClaimedAccrualIndex(offering_id.clone(), holder.clone());
+        let last_claimed_accrual: i128 = env.storage().persistent().get(&last_claimed_accrual_key).unwrap_or(0);
+        let accrual_delta = current_accrual - last_claimed_accrual;
+
+        let total_payout = (accrual_delta.checked_mul(share_bps as i128))
+            .and_then(|x| x.checked_div(BPS_DENOMINATOR))
+            .and_then(|x| x.checked_div(E18))
+            .unwrap_or(0);
 
         // Transfer only if there is a positive payout
         if total_payout > 0 {
@@ -6419,8 +6402,9 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Advance claim index only for periods actually claimed (respecting delay)
+        // Advance claim indices only for periods actually claimed (respecting delay)
         env.storage().persistent().set(&idx_key, &last_claimed_idx);
+        env.storage().persistent().set(&last_claimed_accrual_key, &current_accrual);
 
         // Versioned v2 event: [2, holder, total_payout, periods] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
