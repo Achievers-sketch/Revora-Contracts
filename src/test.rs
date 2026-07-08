@@ -77,6 +77,50 @@ fn test_initialize_rejects_double_init() {
     assert_eq!(result, Err(Ok(ContractError::AlreadyInitialized)));
 }
 
+#[test]
+fn test_deposit_rejects_unauthorized_offering() {
+    let (env, contract_id, token_id, _admin) = setup();
+    let client = RevenueDepositContractClient::new(&env, &contract_id);
+    let unauthorized = Address::generate(&env);
+    let period_id = client.create_period(&100u32, &200u32, &10_000i128);
+
+    crate::test_utils::mint_tokens(&env, &token_id, &unauthorized, 1_000_000);
+
+    let result = client.try_deposit(&unauthorized, &period_id, &5_000i128);
+    assert_eq!(result, Err(Ok(ContractError::UnauthorizedDepositor)));
+}
+
+#[test]
+fn test_deposit_accepts_authorized_offering() {
+    let (env, contract_id, token_id, _admin) = setup();
+    let client = RevenueDepositContractClient::new(&env, &contract_id);
+    let offering = Address::generate(&env);
+    let period_id = client.create_period(&100u32, &200u32, &10_000i128);
+
+    crate::test_utils::mint_tokens(&env, &token_id, &offering, 1_000_000);
+    client.add_authorized_offering(&offering);
+
+    let result = client.try_deposit(&offering, &period_id, &5_000i128);
+    assert_eq!(result, Ok(Ok(())));
+
+    let period = client.get_period(&period_id);
+    assert_eq!(period.revenue_amount, 15_000);
+    assert_eq!(crate::test_utils::get_balance(&env, &token_id, &contract_id), 15_000);
+}
+
+#[test]
+fn test_empty_authorized_offering_set_rejects_all_deposits() {
+    let (env, contract_id, token_id, _admin) = setup();
+    let client = RevenueDepositContractClient::new(&env, &contract_id);
+    let offering = Address::generate(&env);
+    let period_id = client.create_period(&100u32, &200u32, &10_000i128);
+
+    crate::test_utils::mint_tokens(&env, &token_id, &offering, 1_000_000);
+
+    let result = client.try_deposit(&offering, &period_id, &5_000i128);
+    assert_eq!(result, Err(Ok(ContractError::UnauthorizedDepositor)));
+}
+
 // ─── 2. Period creation ───────────────────────────────────────────────────────
 
 #[test]
