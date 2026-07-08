@@ -37,6 +37,8 @@ fn prove_distribution_normal_case() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -102,6 +104,8 @@ fn prove_distribution_digest_is_deterministic() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -158,6 +162,8 @@ fn prove_distribution_sorting_makes_order_invariant() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -298,6 +304,8 @@ fn prove_distribution_empty_holders() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -341,6 +349,8 @@ fn prove_distribution_unknown_period_id_returns_zero_payouts() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -391,6 +401,8 @@ fn prove_distribution_zero_share_bps_yields_zero_payout() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -440,6 +452,8 @@ fn prove_distribution_usdc_6_decimals_normalizes_correctly() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -495,6 +509,8 @@ fn prove_distribution_respects_round_half_up_mode() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -538,6 +554,8 @@ fn prove_distribution_caps_at_max_chunk_periods() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -585,6 +603,8 @@ fn prove_distribution_entry_fields_match() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -635,6 +655,8 @@ fn prove_distribution_different_periods_produce_different_digests() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
