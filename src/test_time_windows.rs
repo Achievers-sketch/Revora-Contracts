@@ -1,4 +1,4 @@
-//! # Report/Claim Window Time Boundary Matrix
+﻿//! # Report/Claim Window Time Boundary Matrix
 //!
 //! Hardens the reporting and claiming window checks based on ledger time.
 //!
