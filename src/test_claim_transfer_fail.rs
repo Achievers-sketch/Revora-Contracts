@@ -188,8 +188,9 @@ fn pending_periods(
             offering_token.clone(),
             holder.clone(),
             0,
-            100,
-        ).0
+            50,
+        )
+        .0
     })
 }
 
@@ -442,16 +443,15 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
 
     // Register a second offering backed by a normal (unarmed) token so its claim succeeds.
     let offering_token_b = Address::generate(&env);
-    let admin_b = Address::generate(&env);
-    let payout_b = env.register_stellar_asset_contract_v2(admin_b.clone());
-    let payout_b_id = payout_b.address();
+    let (token_b_id, token_b) = deploy_failing_token(&env);
+    token_b.mint(&issuer, &1_000_000);
 
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &payout_b_id,
+        &token_b_id,
         &0,
         &symbol_short!(""),
         &0);
@@ -464,7 +464,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &payout_b_id,
+        &token_b_id,
         &100_000,
         &1,
     );

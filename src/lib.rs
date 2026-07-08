@@ -169,7 +169,7 @@ pub enum RevoraError {
     /// Issuer transfer has expired.
     IssuerTransferExpired = 43,
     /// Transfer blocked because the offering has pre-cliff vesting schedules.
-    VestingTransferBlocked = 38,
+    VestingTransferBlocked = 52,
     /// Contract is paused.
     ContractPaused = 44,
     /// Blacklist size limit exceeded.
@@ -191,11 +191,16 @@ pub enum RevoraError {
     /// Wire value: 48. Stable since v1.
     PeriodAlreadyClosed = 48,
 
-    /// Unfreeze reason did not match original freeze reason.
-    FreezeReasonMismatch = 51,
+    /// Concentration enforcement requires a fresh `report_concentration`, but the stored
+    /// concentration data is missing or older than the configured staleness window.
+    ///
+    /// Wire value: 53. Stable since v1.
+    StaleConcentrationData = 53,
 
-    /// Holder is emergency frozen for this offering.
-    HolderFrozen = 52,
+    /// Disclosure URI exceeds the 256-byte maximum.
+    DisclosureUriTooLong = 54,
+    /// Empty URI paired with a non-zero hash is incoherent.
+    InconsistentDisclosure = 55,
 }
 
 pub mod vesting;
@@ -218,6 +223,8 @@ mod test_min_revenue_threshold_boundary;
 // mod test_claim_transfer_fail;
 #[cfg(test)]
 mod test_close_period;
+#[cfg(test)]
+mod test_disclosure;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -349,8 +356,8 @@ const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 /// Emitted when a period is sealed by `close_period`.
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
-/// Emitted by `atomic_close_period` — single boundary event carrying snapshot and accrual sub-hashes.
-const EVENT_PERIOD_SEALED: Symbol = symbol_short!("per_seald");
+/// Emitted when an offering's off-chain disclosure metadata is set or updated (#485).
+const EVENT_DISCLOSURE_UPDATED: Symbol = symbol_short!("disc_upd");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
 const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
@@ -598,6 +605,18 @@ pub struct PlatformFeeModel {
 pub struct InvestmentConstraintsConfig {
     pub min_stake: i128,
     pub max_stake: i128,
+}
+
+/// Off-chain disclosure binding for an offering (#485).
+/// Binds a URI (PPM, K-1 template, etc.) to a 32-byte integrity hash so
+/// investors can verify the off-chain document without trusting the issuer alone.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisclosureMeta {
+    /// Off-chain document URI, e.g. `ipfs://…` or `https://…`. Max 256 bytes.
+    pub uri: Bytes,
+    /// SHA-256 (or equivalent) hash of the document at `uri`. Exactly 32 bytes.
+    pub hash: BytesN<32>,
 }
 
 /// Per-offering audit log summary (#34).
@@ -891,6 +910,10 @@ pub enum PauseState {
 
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
+///
+/// Scoped to the crate: storage keys are an internal implementation detail and are not part
+/// of the contract's external interface, so no contract spec entry is generated for them.
+/// This also keeps the enum clear of the 50-case spec union limit as new keys are added.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PauseState {
@@ -1068,10 +1091,17 @@ pub enum DataKey2 {
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
 
-    /// Per-offering denomination display metadata (denomination_symbol, display_decimals).
-    /// Written once at `register_offering` and never mutated.
-    /// Allows wallets and dashboards to render amounts correctly without guessing token semantics.
-    DenominationMetadata(OfferingId),
+    /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
+    DisclosureMeta(OfferingId),
+
+    /// Per-offering minimum revenue threshold below which reports are skipped.
+    MinRevenueThreshold(OfferingId),
+    /// Per-offering cumulative deposited revenue tracker.
+    DepositedRevenue(OfferingId),
+    /// Per-offering investment constraints (min/max stake).
+    InvestmentConstraints(OfferingId),
+    /// Per-offering supply cap (0 = uncapped).
+    SupplyCap(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -7671,6 +7701,79 @@ impl RevoraRevenueShare {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().has(&DataKey2::ClosedPeriod(offering_id, period_id))
     }
+
+    /// Attach or replace off-chain disclosure metadata for an offering (#485).
+    ///
+    /// Issuers use this to bind a private placement memorandum (PPM), K-1 template,
+    /// or any other off-chain document to the on-chain record so investors can verify
+    /// the document's integrity via the stored hash.
+    ///
+    /// ### Validation
+    /// - `uri` must be at most 256 bytes; longer values return `DisclosureUriTooLong`.
+    /// - An empty `uri` paired with a non-zero `hash` returns `InconsistentDisclosure`.
+    ///   (A zero-hash with an empty URI clears any previous disclosure.)
+    ///
+    /// ### Auth ordering
+    /// `issuer.require_auth()` is called immediately after the frozen guard.
+    pub fn update_disclosure(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        uri: Bytes,
+        hash: BytesN<32>,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // URI length guard: max 256 bytes.
+        if uri.len() > 256 {
+            return Err(RevoraError::DisclosureUriTooLong);
+        }
+
+        // Coherence guard: non-zero hash requires a URI.
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if uri.is_empty() && hash != zero_hash {
+            return Err(RevoraError::InconsistentDisclosure);
+        }
+
+        let key = DataKey2::DisclosureMeta(offering_id);
+        env.storage()
+            .persistent()
+            .set(&key, &DisclosureMeta { uri: uri.clone(), hash: hash.clone() });
+
+        Self::emit_v2_event(
+            &env,
+            (EVENT_DISCLOSURE_UPDATED, issuer, namespace, token),
+            (uri, hash),
+        );
+
+        Ok(())
+    }
+
+    /// Return the off-chain disclosure metadata for an offering, if set.
+    pub fn get_disclosure(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<DisclosureMeta> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::DisclosureMeta(offering_id))
+    }
 }
 
 // â”€â”€ Holder shares, claims, admin, governance, and utility methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -7975,35 +8078,6 @@ impl RevoraRevenueShare {
     /// * `max_periods` - The maximum number of periods to claim in this call.
     ///
     /// # Events
-
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic (#38).
-    pub fn get_pending_periods(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        holder: Address,
-    ) -> Vec<u64> {
-        let offering_id = OfferingId { issuer, namespace, token };
-        let count_key = DataKey::PeriodCount(offering_id.clone());
-        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
-        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
-
-        let mut periods = Vec::new(&env);
-        for i in start_idx..period_count {
-            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
-            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-            if period_id == 0 {
-                continue;
-            }
-            periods.push_back(period_id);
-        }
-        periods
-    }
-
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
     /// periods remain, otherwise `None`. `limit` of 0 or greater than `MAX_PAGE_LIMIT` will be
