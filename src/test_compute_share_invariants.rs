@@ -49,6 +49,9 @@
 #![cfg(test)]
 extern crate std;
 
+extern crate alloc;
+
+use alloc::format;
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
 use alloc::format;
 use soroban_sdk::Env;
@@ -586,8 +589,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        i128::MAX - 9_999, // Near-max extreme amount (non-zero remainder)
-        i128::MIN + 9_999, // Near-min extreme amount (non-zero remainder)
+        i128::MAX - 9_999, // Large positive with high remainder
+        i128::MIN + 9_999, // Large negative with high remainder
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];

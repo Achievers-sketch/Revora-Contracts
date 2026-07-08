@@ -181,16 +181,16 @@ fn pending_periods(
     holder: &Address,
 ) -> soroban_sdk::Vec<u64> {
     env.as_contract(revora_id, || {
-        RevoraRevenueShare::get_pending_periods_page(
+        let (periods, _) = RevoraRevenueShare::get_pending_periods_page(
             env.clone(),
             issuer.clone(),
             symbol_short!("def"),
             offering_token.clone(),
             holder.clone(),
             0,
-            50,
-        )
-        .0
+            20,
+        );
+        periods
     })
 }
 
@@ -441,15 +441,16 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
 
     // Register a second offering backed by a normal (unarmed) token so its claim succeeds.
     let offering_token_b = Address::generate(&env);
-    let (token_b_id, token_b) = deploy_failing_token(&env);
-    token_b.mint(&issuer, &1_000_000);
+    let admin_b = Address::generate(&env);
+    let payout_asset_b = crate::test_utils::create_token(&env, &admin_b);
+    crate::test_utils::mint_tokens(&env, &payout_asset_b, &issuer, 100_000);
 
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &token_b_id,
+        &payout_asset_b,
         &0,
         &None,
     );
@@ -461,7 +462,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &token_b_id,
+        &payout_asset_b,
         &100_000,
         &1,
     );

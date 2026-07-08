@@ -100,6 +100,8 @@ pub enum RevoraError {
     SnapshotNotFinalized = 49,
     /// The recomputed snapshot digest does not match the committed `content_hash`.
     SnapshotHashMismatch = 50,
+    /// Concentration data is missing or stale for an enforced offering.
+    StaleConcentrationData = 51,
     /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
     /// A transfer is already pending for this offering.
@@ -135,6 +137,8 @@ pub enum RevoraError {
     /// Multisig proposal has expired.
     /// Wire value: 30. Stable since v1.
     ProposalExpired = 30,
+    /// Holder jurisdiction is not permitted by the offering's compliance allowlist.
+    JurisdictionDisallowed = 31,
     /// Cross-contract token transfer failed.
     TransferFailed = 39,
     /// Contract is already at the target version; no migration needed.
@@ -154,7 +158,7 @@ pub enum RevoraError {
     /// Issuer transfer has expired.
     IssuerTransferExpired = 43,
     /// Transfer blocked because the offering has pre-cliff vesting schedules.
-    VestingTransferBlocked = 52,
+    VestingTransferBlocked = 38,
     /// Contract is paused.
     ContractPaused = 44,
     /// Blacklist size limit exceeded.
@@ -190,7 +194,15 @@ mod test_duplicates;
 #[cfg(test)]
 mod test_event_indexed_v2;
 #[cfg(test)]
+mod test_jurisdiction;
+#[cfg(test)]
+mod test_accrual_ledger;
+#[cfg(test)]
+mod structured_error_tests;
+#[cfg(test)]
 mod test_min_revenue_threshold_boundary;
+#[cfg(test)]
+mod test_utils;
 // #[cfg(test)]
 // mod test_claim_transfer_fail;
 #[cfg(test)]
@@ -239,6 +251,7 @@ const EVENT_REV_DEPOSIT_V2: Symbol = symbol_short!("rev_dep2");
 const EVENT_REV_DEP_SNAP_V2: Symbol = symbol_short!("rev_snp2");
 const EVENT_CLAIM_V2: Symbol = symbol_short!("claim2");
 const EVENT_SHARE_SET_V2: Symbol = symbol_short!("sh_set2");
+const EVENT_ACC_UPD: Symbol = symbol_short!("acc_upd");
 const EVENT_FREEZE_V2: Symbol = symbol_short!("frz2");
 const EVENT_CLAIM_DELAY_SET_V2: Symbol = symbol_short!("dly_set2");
 const EVENT_CONCENTRATION_WARNING_V2: Symbol = symbol_short!("conc2");
@@ -260,6 +273,14 @@ pub enum ProposalAction {
     AddOwner(Address),
     RemoveOwner(Address),
     SetProposalDuration(u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseState {
+    NotPaused,
+    SoftPaused,
+    HardPaused,
 }
 
 #[contracttype]
@@ -334,6 +355,11 @@ const EVENT_MULTISIG_INIT: Symbol = symbol_short!("ms_init");
 const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 /// Emitted when `repair_audit_summary` writes a corrected `AuditSummary` to storage.
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
+const EVENT_JUR_SCOPE_HOLDER: Symbol = symbol_short!("holder");
+const EVENT_JUR_SCOPE_ALLOW: Symbol = symbol_short!("allow");
+const EVENT_JUR_ACTION_SHARE: Symbol = symbol_short!("share");
+const EVENT_JUR_ACTION_SNAPSHOT: Symbol = symbol_short!("snap");
+const EVENT_JUR_UNSET: Symbol = symbol_short!("unset");
 
 /// Emitted when a redemption window is set for an offering.
 const EVENT_REDEMPTION_WINDOW_SET: Symbol = symbol_short!("rdm_win");
@@ -357,8 +383,7 @@ const EVENT_PLAT_FEE_SET: Symbol = symbol_short!("pfee_set");
 /// Emitted by `report_revenue` when a non-zero platform fee is routed to the treasury (#468).
 const EVENT_PLAT_FEE: Symbol = symbol_short!("plat_fee");
 const BPS_DENOMINATOR: i128 = 10_000;
-/// E18 fixed-point precision.
-const E18: i128 = 1_000_000_000_000_000_000;
+const ACCRUAL_SCALE_E18: i128 = 1_000_000_000_000_000_000;
 /// Stellar network canonical decimal precision (7 decimal places, i.e., stroops).
 const STELLAR_CANONICAL_DECIMALS: u32 = 7;
 /// Maximum accepted decimal precision (safety cap for normalization math).
@@ -394,9 +419,9 @@ const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("dly_set");
 /// Offerings are immutable once registered.
 // â”€â”€ Data structures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 /// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
-pub const CONTRACT_VERSION: u32 = 23;
+pub const CONTRACT_VERSION: u32 = 25;
 /// Persistent storage layout version. Bump when adding/renaming DataKey variants.
-pub const STORAGE_LAYOUT_VERSION: u32 = 1;
+pub const STORAGE_LAYOUT_VERSION: u32 = 2;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -576,6 +601,21 @@ pub struct SimulateDistributionResult {
     pub total_distributed: i128,
     /// Payout per holder (holder address, amount).
     pub payouts: Vec<(Address, i128)>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HolderShareCheckpoint {
+    pub start_index: u32,
+    pub share_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HolderAccrualState {
+    pub last_settled_idx: u32,
+    pub last_acc_per_share_e18: i128,
+    pub accrued_owed: i128,
 }
 
 /// Versioned structured topic payload for indexers.
@@ -894,6 +934,14 @@ pub enum DataKey2 {
     LastReportedPeriodId(OfferingId),
     /// Last deposited period_id for an offering.
     LastDepositedPeriodId(OfferingId),
+    /// Supply cap for an offering's cumulative deposited revenue.
+    SupplyCap(OfferingId),
+    /// Cumulative deposited revenue tracked against the supply cap.
+    DepositedRevenue(OfferingId),
+    /// Per-offering investment constraints.
+    InvestmentConstraints(OfferingId),
+    /// Per-offering minimum revenue threshold.
+    MinRevenueThreshold(OfferingId),
     /// Payment token decimals configured for an offering.
     PaymentTokenDecimals(OfferingId),
     /// Offering-scoped freeze flag.
@@ -914,6 +962,18 @@ pub enum DataKey2 {
     StressDataEntry(Address, u32),
     /// Tracks total amount of dummy data allocated per admin.
     StressDataCount(Address),
+    /// Holder's configured jurisdiction tag for (offering_id, holder).
+    HolderJurisdiction(OfferingId, Address),
+    /// Per-offering jurisdiction allowlist. Empty means compliance gating is disabled.
+    AllowedJurisdictions(OfferingId),
+    /// Global cumulative normalized accrual per 1 bps share, scaled by 1e18.
+    GlobalAccPerShareE18(OfferingId),
+    /// Snapshot of cumulative accrual after `index` deposited periods.
+    AccPerShareAtIndex(OfferingId, u32),
+    /// Cached holder accrual state used to freeze matured entitlements across share changes.
+    HolderAccrualState(OfferingId, Address),
+    /// Piecewise-constant share schedule keyed by deposited-period index.
+    HolderShareSchedule(OfferingId, Address),
     /// Packed flags: (event_versioning_enabled: bool, event_only_mode: bool).
     ContractFlags,
 
@@ -1300,18 +1360,12 @@ impl RevoraRevenueShare {
         env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
     }
 
-    /// Dual-emit V2 and V3 indexed events for the same logical payload.
-    /// V2 events are published unchanged at `EVENT_INDEXED_V2` for existing subscribers.
-    /// V3 events are published at `EVENT_INDEXED_V3` with version=3 for forward-compatible indexers.
-    /// Both use `EventIndexTopicV3` internally — the V2 topic still carries version=2 in its event data.
-    fn emit_v2_and_v3(
-        env: &Env,
-        v2_topic: EventIndexTopicV2,
-        v3_topic: EventIndexTopicV3,
-        data: impl IntoVal<Env, soroban_sdk::Val>,
-    ) {
-        env.events().publish((EVENT_INDEXED_V2, v2_topic), &data);
-        env.events().publish((EVENT_INDEXED_V3, v3_topic), &data);
+    fn jurisdiction_set_event(env: &Env) -> Symbol {
+        Symbol::new(env, "jur_set")
+    }
+
+    fn jurisdiction_reject_event(env: &Env) -> Symbol {
+        Symbol::new(env, "jur_reject")
     }
 
     fn is_event_versioning_enabled(_env: Env) -> bool {
@@ -1427,9 +1481,16 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        let classes_key = DataKey2::OfferingClasses(offering_id.clone());
-        let classes: Option<Vec<(ShareClass, ClassConfig)>> =
-            env.storage().persistent().get(&classes_key);
+        Self::require_holder_jurisdiction_allowed(
+            env,
+            &offering_id,
+            &holder,
+            EVENT_JUR_ACTION_SHARE,
+        )?;
+
+        // Maintain a running total of persisted holder shares for this offering.
+        let total_key = DataKey::HolderShareTotal(offering_id.clone());
+        let mut current_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
 
         match classes {
             Some(cls_vec) => {
@@ -1453,47 +1514,14 @@ impl RevoraRevenueShare {
             return Err(RevoraError::InvalidShareBps);
         }
 
-        let is_new_holder = old_share == 0 && share_bps > 0;
-        let is_leaving_holder = old_share > 0 && share_bps == 0;
+        Self::cache_holder_accrual_through_matured(env, &offering_id, &holder);
 
-        if is_new_holder || is_leaving_holder {
-            if let Some(category) = env
-                .storage()
-                .persistent()
-                .get::<_, Symbol>(&DataKey2::HolderCategory(offering_id.clone(), holder.clone()))
-            {
-                let count_key = DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
-                let mut current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-                if is_new_holder {
-                    if let Some(restrictions) = env
-                        .storage()
-                        .persistent()
-                        .get::<_, TransferRestrictions>(&DataKey2::TransferRestrictions(offering_id.clone(), category.clone()))
-                    {
-                        if current_count >= restrictions.max_holders {
-                            return Err(RevoraError::CategoryCapReached);
-                        }
-                    }
-                    current_count += 1;
-                    env.storage().persistent().set(&count_key, &current_count);
-                } else if is_leaving_holder {
-                    env.storage().persistent().set(&count_key, &current_count.saturating_sub(1));
-                }
-            }
-        }
-
-        // Persist updated holder share, running total, and update last claimed accrual index.
+        // Persist updated holder share and running total.
         env.storage()
             .persistent()
             .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
         env.storage().persistent().set(&total_key, &new_total);
-        
-        // Update last claimed accrual index to current index to settle existing accrual
-        let current_accrual_key = DataKey::AccrualIndexE18(offering_id.clone());
-        let current_accrual: i128 = env.storage().persistent().get(&current_accrual_key).unwrap_or(0);
-        let last_claimed_accrual_key = DataKey::LastClaimedAccrualIndex(offering_id.clone(), holder.clone());
-        env.storage().persistent().set(&last_claimed_accrual_key, &current_accrual);
+        Self::record_holder_share_transition(env, &offering_id, &holder, old_share, share_bps);
 
         env.events().publish(
             (EVENT_SHARE_SET, issuer.clone(), namespace.clone(), token.clone()),
@@ -1506,6 +1534,318 @@ impl RevoraRevenueShare {
             (holder, share_bps),
         );
         Ok(())
+    }
+
+    fn get_period_count_internal(env: &Env, offering_id: &OfferingId) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::PeriodCount(offering_id.clone()))
+            .unwrap_or(0)
+    }
+
+    fn accrual_delta_e18(amount: i128) -> i128 {
+        amount
+            .checked_mul(ACCRUAL_SCALE_E18)
+            .unwrap_or(i128::MAX)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(0)
+    }
+
+    fn get_acc_per_share_at_index(env: &Env, offering_id: &OfferingId, index: u32) -> i128 {
+        if index == 0 {
+            return 0;
+        }
+        env.storage()
+            .persistent()
+            .get::<_, i128>(&DataKey2::AccPerShareAtIndex(offering_id.clone(), index))
+            .unwrap_or(0)
+    }
+
+    fn get_holder_share_schedule(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+    ) -> Vec<HolderShareCheckpoint> {
+        if let Some(schedule) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<HolderShareCheckpoint>>(&DataKey2::HolderShareSchedule(
+                offering_id.clone(),
+                holder.clone(),
+            ))
+        {
+            return schedule;
+        }
+
+        let current_share: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+            .unwrap_or(0);
+        let mut schedule = Vec::new(env);
+        if current_share > 0 {
+            schedule.push_back(HolderShareCheckpoint { start_index: 0, share_bps: current_share });
+        }
+        schedule
+    }
+
+    fn record_holder_share_transition(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+        old_share: u32,
+        new_share: u32,
+    ) {
+        if old_share == new_share {
+            return;
+        }
+
+        let period_count = Self::get_period_count_internal(env, offering_id);
+        let existing = Self::get_holder_share_schedule(env, offering_id, holder);
+        let mut updated = Vec::new(env);
+
+        for i in 0..existing.len() {
+            let checkpoint = existing.get(i).unwrap();
+            if checkpoint.start_index == period_count {
+                continue;
+            }
+            updated.push_back(checkpoint);
+        }
+
+        updated.push_back(HolderShareCheckpoint { start_index: period_count, share_bps: new_share });
+        env.storage().persistent().set(
+            &DataKey2::HolderShareSchedule(offering_id.clone(), holder.clone()),
+            &updated,
+        );
+    }
+
+    fn get_holder_accrual_state(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+    ) -> HolderAccrualState {
+        let last_claimed_idx: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::LastClaimedIdx(offering_id.clone(), holder.clone()))
+            .unwrap_or(0);
+
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<_, HolderAccrualState>(&DataKey2::HolderAccrualState(
+                offering_id.clone(),
+                holder.clone(),
+            ))
+            .unwrap_or(HolderAccrualState {
+                last_settled_idx: last_claimed_idx,
+                last_acc_per_share_e18: Self::get_acc_per_share_at_index(
+                    env,
+                    offering_id,
+                    last_claimed_idx,
+                ),
+                accrued_owed: 0,
+            });
+
+        if state.last_settled_idx < last_claimed_idx {
+            state.last_settled_idx = last_claimed_idx;
+            state.last_acc_per_share_e18 =
+                Self::get_acc_per_share_at_index(env, offering_id, last_claimed_idx);
+            state.accrued_owed = 0;
+        }
+
+        state
+    }
+
+    fn compute_holder_payout_for_range(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+        start_idx: u32,
+        end_idx: u32,
+    ) -> i128 {
+        if start_idx >= end_idx {
+            return 0;
+        }
+
+        let schedule = Self::get_holder_share_schedule(env, offering_id, holder);
+        if schedule.is_empty() {
+            return 0;
+        }
+
+        let mut total = 0_i128;
+        let mut current_index = start_idx;
+        let mut current_share = 0_u32;
+        let mut schedule_idx = 0_u32;
+
+        while schedule_idx < schedule.len() {
+            let checkpoint = schedule.get(schedule_idx).unwrap();
+            if checkpoint.start_index > start_idx {
+                break;
+            }
+            current_share = checkpoint.share_bps;
+            schedule_idx = schedule_idx.saturating_add(1);
+        }
+
+        while current_index < end_idx {
+            while schedule_idx < schedule.len() {
+                let checkpoint = schedule.get(schedule_idx).unwrap();
+                if checkpoint.start_index > current_index {
+                    break;
+                }
+                current_share = checkpoint.share_bps;
+                schedule_idx = schedule_idx.saturating_add(1);
+            }
+
+            if current_share > 0 {
+                let acc_end =
+                    Self::get_acc_per_share_at_index(env, offering_id, current_index.saturating_add(1));
+                let acc_start = Self::get_acc_per_share_at_index(env, offering_id, current_index);
+                let delta = acc_end.saturating_sub(acc_start);
+                total = total.saturating_add(
+                    delta.saturating_mul(current_share as i128) / ACCRUAL_SCALE_E18,
+                );
+            }
+
+            current_index = current_index.saturating_add(1);
+        }
+
+        total
+    }
+
+    fn find_matured_claim_end_idx(env: &Env, offering_id: &OfferingId, start_idx: u32) -> u32 {
+        let period_count = Self::get_period_count_internal(env, offering_id);
+        if start_idx >= period_count {
+            return start_idx;
+        }
+
+        let delay_secs: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::ClaimDelaySecs(offering_id.clone()))
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let mut end_idx = start_idx;
+
+        while end_idx < period_count {
+            let entry_key = DataKey::PeriodEntry(offering_id.clone(), end_idx);
+            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
+            if period_id == 0 {
+                end_idx = end_idx.saturating_add(1);
+                continue;
+            }
+
+            let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
+            let deposit_time: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+            if delay_secs > 0 && now < deposit_time.saturating_add(delay_secs) {
+                break;
+            }
+
+            end_idx = end_idx.saturating_add(1);
+        }
+
+        end_idx
+    }
+
+    fn cache_holder_accrual_through_matured(env: &Env, offering_id: &OfferingId, holder: &Address) {
+        let mut state = Self::get_holder_accrual_state(env, offering_id, holder);
+        let matured_end = Self::find_matured_claim_end_idx(env, offering_id, state.last_settled_idx);
+        if matured_end <= state.last_settled_idx {
+            return;
+        }
+
+        let delta = Self::compute_holder_payout_for_range(
+            env,
+            offering_id,
+            holder,
+            state.last_settled_idx,
+            matured_end,
+        );
+        state.accrued_owed = state.accrued_owed.saturating_add(delta);
+        state.last_settled_idx = matured_end;
+        state.last_acc_per_share_e18 = Self::get_acc_per_share_at_index(env, offering_id, matured_end);
+
+        env.storage().persistent().set(
+            &DataKey2::HolderAccrualState(offering_id.clone(), holder.clone()),
+            &state,
+        );
+    }
+
+    fn normalize_jurisdictions(env: &Env, jurisdictions: Vec<Symbol>) -> Vec<Symbol> {
+        let mut normalized = Vec::new(env);
+        for i in 0..jurisdictions.len() {
+            let jurisdiction = jurisdictions.get(i).unwrap();
+            if !Self::vec_contains_symbol(&normalized, &jurisdiction) {
+                normalized.push_back(jurisdiction);
+            }
+        }
+        normalized
+    }
+
+    fn vec_contains_symbol(values: &Vec<Symbol>, target: &Symbol) -> bool {
+        for i in 0..values.len() {
+            if values.get(i).unwrap() == *target {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_allowed_jurisdictions_internal(env: &Env, offering_id: &OfferingId) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::AllowedJurisdictions(offering_id.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn get_holder_jurisdiction_internal(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+    ) -> Option<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::HolderJurisdiction(offering_id.clone(), holder.clone()))
+    }
+
+    fn emit_jurisdiction_reject(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+        jurisdiction: Symbol,
+        action: Symbol,
+    ) {
+        env.events().publish(
+            (
+                Self::jurisdiction_reject_event(env),
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            ),
+            (holder.clone(), jurisdiction, action),
+        );
+    }
+
+    fn require_holder_jurisdiction_allowed(
+        env: &Env,
+        offering_id: &OfferingId,
+        holder: &Address,
+        action: Symbol,
+    ) -> Result<(), RevoraError> {
+        let allowed = Self::get_allowed_jurisdictions_internal(env, offering_id);
+        if allowed.is_empty() {
+            return Ok(());
+        }
+
+        let jurisdiction = Self::get_holder_jurisdiction_internal(env, offering_id, holder)
+            .unwrap_or(EVENT_JUR_UNSET);
+
+        if Self::vec_contains_symbol(&allowed, &jurisdiction) {
+            return Ok(());
+        }
+
+        Self::emit_jurisdiction_reject(env, offering_id, holder, jurisdiction, action);
+        Err(RevoraError::JurisdictionDisallowed)
     }
 
     /// Return the explicitly persisted payment token lock for an offering, if any.
@@ -1623,6 +1963,23 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&count_key, &(count + 1));
         Self::commit_period_id(env, last_period_key, period_id);
 
+        let decimals = Self::get_payment_token_decimals(
+            env.clone(),
+            offering_id.issuer.clone(),
+            offering_id.namespace.clone(),
+            offering_id.token.clone(),
+        );
+        let normalized = Self::normalize_amount(amount, decimals);
+        let acc_delta_e18 = Self::accrual_delta_e18(normalized);
+        let global_acc_key = DataKey2::GlobalAccPerShareE18(offering_id.clone());
+        let current_acc: i128 = env.storage().persistent().get(&global_acc_key).unwrap_or(0);
+        let next_acc = current_acc.saturating_add(acc_delta_e18);
+        env.storage().persistent().set(&global_acc_key, &next_acc);
+        env.storage().persistent().set(
+            &DataKey2::AccPerShareAtIndex(offering_id.clone(), count + 1),
+            &next_acc,
+        );
+
         // Update cumulative deposited revenue and emit cap-reached event if applicable (#96)
         let deposited_key = DataKey2::DepositedRevenue(offering_id.clone());
         let deposited: i128 = env.storage().persistent().get(&deposited_key).unwrap_or(0);
@@ -1658,6 +2015,10 @@ impl RevoraRevenueShare {
             env,
             (EVENT_REV_DEPOSIT_V2, issuer.clone(), namespace.clone(), token.clone()),
             (payment_token, amount, period_id),
+        );
+        env.events().publish(
+            (EVENT_ACC_UPD, issuer, namespace, token),
+            (period_id, count + 1, acc_delta_e18, next_acc),
         );
         Ok(())
     }
@@ -2438,12 +2799,19 @@ impl RevoraRevenueShare {
                 .set(&DataKey::ClaimDelaySecs(new_offering_id.clone()), &delay);
             env.storage().persistent().remove(&DataKey::ClaimDelaySecs(offering_id.clone()));
         }
-        if let Some(snap_config) =
-            env.storage().persistent().get::<_, bool>(&DataKey::SnapshotConfig(offering_id.clone()))
+        if let Some(allowed_jurisdictions) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Symbol>>(&DataKey2::AllowedJurisdictions(offering_id.clone()))
         {
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotConfig(new_offering_id.clone()), &snap_config);
+            env.storage().persistent().set(
+                &DataKey2::AllowedJurisdictions(new_offering_id.clone()),
+                &allowed_jurisdictions,
+            );
+            env.storage().persistent().remove(&DataKey2::AllowedJurisdictions(offering_id.clone()));
+        }
+        if let Some(snap_config) = env.storage().persistent().get::<_, bool>(&DataKey::SnapshotConfig(offering_id.clone())) {
+            env.storage().persistent().set(&DataKey::SnapshotConfig(new_offering_id.clone()), &snap_config);
             env.storage().persistent().remove(&DataKey::SnapshotConfig(offering_id.clone()));
         }
         if let Some(snap_ref) =
@@ -5607,12 +5975,18 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
-        // Validate all share_bps before writing anything (fail-fast).
+        // Validate all share_bps and jurisdiction rules before writing anything (fail-fast).
         for i in 0..batch_len {
-            let (_, share_bps) = holders.get(i).unwrap();
+            let (holder, share_bps) = holders.get(i).unwrap();
             if share_bps > 10_000 {
                 return Err(RevoraError::InvalidShareBps);
             }
+            Self::require_holder_jurisdiction_allowed(
+                &env,
+                &offering_id,
+                &holder,
+                EVENT_JUR_ACTION_SNAPSHOT,
+            )?;
         }
 
         let mut added_bps: u32 = 0;
@@ -5652,10 +6026,13 @@ impl RevoraRevenueShare {
                 return Err(RevoraError::InvalidShareBps);
             }
 
+            Self::cache_holder_accrual_through_matured(&env, &offering_id, &holder);
+
             // Update live holder share so claim() works immediately.
             env.storage()
                 .persistent()
                 .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
+            Self::record_holder_share_transition(&env, &offering_id, &holder, old_share, share_bps);
 
             current_total = new_total;
             added_bps = added_bps.saturating_add(share_bps);
@@ -6073,6 +6450,112 @@ impl RevoraRevenueShare {
             .unwrap_or(0)
     }
 
+    /// Set or update a holder's jurisdiction tag for an offering.
+    pub fn set_holder_jurisdiction(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        jurisdiction: Symbol,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage().persistent().set(
+            &DataKey2::HolderJurisdiction(offering_id.clone(), holder.clone()),
+            &jurisdiction,
+        );
+        env.events().publish(
+            (
+                Self::jurisdiction_set_event(&env),
+                issuer,
+                namespace,
+                token,
+            ),
+            (EVENT_JUR_SCOPE_HOLDER, holder, jurisdiction),
+        );
+        Ok(())
+    }
+
+    /// Read a holder's configured jurisdiction tag for an offering.
+    pub fn get_holder_jurisdiction(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> Option<Symbol> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        Self::get_holder_jurisdiction_internal(&env, &offering_id, &holder)
+    }
+
+    /// Replace the offering's allowed jurisdiction set.
+    ///
+    /// An empty list disables jurisdiction gating for future share writes and snapshot inclusion.
+    pub fn set_allowed_jurisdictions(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        jurisdictions: Vec<Symbol>,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let normalized = Self::normalize_jurisdictions(&env, jurisdictions);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::AllowedJurisdictions(offering_id), &normalized);
+        env.events().publish(
+            (
+                Self::jurisdiction_set_event(&env),
+                issuer,
+                namespace,
+                token,
+            ),
+            (EVENT_JUR_SCOPE_ALLOW, normalized),
+        );
+        Ok(())
+    }
+
+    /// Return the offering's allowed jurisdiction list in stored order.
+    pub fn get_allowed_jurisdictions(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Vec<Symbol> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        Self::get_allowed_jurisdictions_internal(&env, &offering_id)
+    }
+
     /// Set the claim delay in seconds for an offering.
     pub fn set_claim_delay(
         env: Env,
@@ -6264,17 +6747,6 @@ impl RevoraRevenueShare {
             return Err(RevoraError::HolderBlacklisted);
         }
 
-        let share_bps = Self::get_holder_share(
-            env.clone(),
-            offering_id.issuer.clone(),
-            offering_id.namespace.clone(),
-            offering_id.token.clone(),
-            holder.clone(),
-        );
-        if share_bps == 0 {
-            return Err(RevoraError::NoPendingClaims);
-        }
-
         Self::require_claim_window_open(&env, &offering_id)?;
 
         let count_key = DataKey::PeriodCount(offering_id.clone());
@@ -6343,17 +6815,29 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ClaimDelayNotElapsed);
         }
 
-        // Calculate total payout using e18 accrual index
-        let current_accrual_key = DataKey::AccrualIndexE18(offering_id.clone());
-        let current_accrual: i128 = env.storage().persistent().get(&current_accrual_key).unwrap_or(0);
-        let last_claimed_accrual_key = DataKey::LastClaimedAccrualIndex(offering_id.clone(), holder.clone());
-        let last_claimed_accrual: i128 = env.storage().persistent().get(&last_claimed_accrual_key).unwrap_or(0);
-        let accrual_delta = current_accrual - last_claimed_accrual;
+        let mut accrual_state = Self::get_holder_accrual_state(&env, &offering_id, &holder);
+        if accrual_state.last_settled_idx < start_idx {
+            accrual_state.last_settled_idx = start_idx;
+            accrual_state.last_acc_per_share_e18 =
+                Self::get_acc_per_share_at_index(&env, &offering_id, start_idx);
+            accrual_state.accrued_owed = 0;
+        }
 
-        let total_payout = (accrual_delta.checked_mul(share_bps as i128))
-            .and_then(|x| x.checked_div(BPS_DENOMINATOR))
-            .and_then(|x| x.checked_div(E18))
-            .unwrap_or(0);
+        if last_claimed_idx > accrual_state.last_settled_idx {
+            let delta = Self::compute_holder_payout_for_range(
+                &env,
+                &offering_id,
+                &holder,
+                accrual_state.last_settled_idx,
+                last_claimed_idx,
+            );
+            accrual_state.accrued_owed = accrual_state.accrued_owed.saturating_add(delta);
+            accrual_state.last_settled_idx = last_claimed_idx;
+            accrual_state.last_acc_per_share_e18 =
+                Self::get_acc_per_share_at_index(&env, &offering_id, last_claimed_idx);
+        }
+
+        let total_payout = accrual_state.accrued_owed;
 
         // Transfer only if there is a positive payout
         if total_payout > 0 {
@@ -6370,7 +6854,18 @@ impl RevoraRevenueShare {
 
         // Advance claim indices only for periods actually claimed (respecting delay)
         env.storage().persistent().set(&idx_key, &last_claimed_idx);
-        env.storage().persistent().set(&last_claimed_accrual_key, &current_accrual);
+        env.storage().persistent().set(
+            &DataKey2::HolderAccrualState(offering_id.clone(), holder.clone()),
+            &HolderAccrualState {
+                last_settled_idx: last_claimed_idx,
+                last_acc_per_share_e18: Self::get_acc_per_share_at_index(
+                    &env,
+                    &offering_id,
+                    last_claimed_idx,
+                ),
+                accrued_owed: 0,
+            },
+        );
 
         // Versioned v2 event: [2, holder, total_payout, periods] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
@@ -7056,7 +7551,6 @@ impl RevoraRevenueShare {
         env: &Env,
         offering_id: &OfferingId,
         holder: &Address,
-        share_bps: u32,
         requested_start_idx: u32,
         count: Option<u32>,
     ) -> (i128, Option<u32>) {
@@ -7107,54 +7601,13 @@ impl RevoraRevenueShare {
                 return (total, Some(idx));
             }
 
-            let rev_key = DataKey::PeriodRevenue(offering_id.clone(), period_id);
-            let revenue: i128 = env.storage().persistent().get(&rev_key).unwrap_or(0);
-            let decimals = Self::get_payment_token_decimals(
-                env.clone(),
-                offering_id.issuer.clone(),
-                offering_id.namespace.clone(),
-                offering_id.token.clone(),
-            );
-            let normalized = Self::normalize_amount(revenue, decimals);
-            let classes_key = DataKey2::OfferingClasses(offering_id.clone());
-            let classes: Option<Vec<(ShareClass, ClassConfig)>> =
-                env.storage().persistent().get(&classes_key);
-
-            let payout = if classes.is_some() {
-                let mut p = 0_i128;
-                if let Some(ref cls_vec) = classes {
-                    for (sc, config) in cls_vec.iter() {
-                        let holder_share = env
-                            .storage()
-                            .persistent()
-                            .get(&DataKey2::HolderShareClass(
-                                offering_id.clone(),
-                                holder.clone(),
-                                sc.clone(),
-                            ))
-                            .unwrap_or(0);
-                        if holder_share > 0 {
-                            let class_rev = Self::compute_share(
-                                env.clone(),
-                                normalized,
-                                config.bps,
-                                RoundingMode::Truncation,
-                            );
-                            let holder_payout = Self::compute_share(
-                                env.clone(),
-                                class_rev,
-                                holder_share,
-                                RoundingMode::Truncation,
-                            );
-                            p = p.saturating_add(holder_payout);
-                        }
-                    }
-                }
-                p
-            } else {
-                Self::compute_share(env.clone(), normalized, share_bps, RoundingMode::Truncation)
-            };
-            total = total.saturating_add(payout);
+            total = total.saturating_add(Self::compute_holder_payout_for_range(
+                env,
+                offering_id,
+                holder,
+                idx,
+                idx.saturating_add(1),
+            ));
             processed = processed.saturating_add(1);
             idx = idx.saturating_add(1);
         }
@@ -7349,17 +7802,6 @@ impl RevoraRevenueShare {
         token: Address,
         holder: Address,
     ) -> i128 {
-        let share_bps = Self::get_holder_share(
-            env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
-            holder.clone(),
-        );
-        if share_bps == 0 {
-            return 0;
-        }
-
         let offering_id = OfferingId {
             issuer: issuer.clone(),
             namespace: namespace.clone(),
@@ -7372,8 +7814,7 @@ impl RevoraRevenueShare {
             return 0;
         }
 
-        let (total, _) =
-            Self::compute_claimable_preview(&env, &offering_id, &holder, share_bps, 0, None);
+        let (total, _) = Self::compute_claimable_preview(&env, &offering_id, &holder, 0, None);
         total
     }
 
@@ -7429,17 +7870,6 @@ impl RevoraRevenueShare {
         start_idx: u32,
         count: u32,
     ) -> (i128, Option<u32>) {
-        let share_bps = Self::get_holder_share(
-            env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
-            holder.clone(),
-        );
-        if share_bps == 0 {
-            return (0, None);
-        }
-
         let offering_id = OfferingId {
             issuer: issuer.clone(),
             namespace: namespace.clone(),
@@ -7456,7 +7886,6 @@ impl RevoraRevenueShare {
             &env,
             &offering_id,
             &holder,
-            share_bps,
             start_idx,
             Some(count),
         )
@@ -7547,6 +7976,17 @@ impl RevoraRevenueShare {
         let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
         let deposit_time = env.ledger().timestamp();
         env.storage().persistent().set(&time_key, &deposit_time);
+
+        let normalized = Self::normalize_amount(amount, STELLAR_CANONICAL_DECIMALS);
+        let acc_delta_e18 = Self::accrual_delta_e18(normalized);
+        let global_acc_key = DataKey2::GlobalAccPerShareE18(offering_id.clone());
+        let current_acc: i128 = env.storage().persistent().get(&global_acc_key).unwrap_or(0);
+        let next_acc = current_acc.saturating_add(acc_delta_e18);
+        env.storage().persistent().set(&global_acc_key, &next_acc);
+        env.storage().persistent().set(
+            &DataKey2::AccPerShareAtIndex(offering_id.clone(), count + 1),
+            &next_acc,
+        );
 
         // Update cumulative deposited revenue
         let deposited_key = DataKey2::DepositedRevenue(offering_id.clone());
