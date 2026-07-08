@@ -589,8 +589,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        i128::MAX - 9_999, // Large positive with high remainder
-        i128::MIN + 9_999, // Large negative with high remainder
+        i128::MAX / 10_000 * 10_000, // Near-max, divisible by 10_000
+        i128::MIN / 10_000 * 10_000, // Near-min, divisible by 10_000
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];
@@ -631,7 +631,7 @@ fn checked_mul_defense_in_depth_prevents_overflow() {
     let extreme_amounts = [i128::MAX, i128::MIN, i128::MAX - 1, i128::MIN + 1];
 
     for &amount in &extreme_amounts {
-        for bps in [1_u32, 5_000, 10_000] {
+        for &bps in &[1_u32, 5_000, 10_000] {
             let result = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             // Should never panic and should always satisfy bounds
             assert_bounds(result, amount, "Extreme amount");

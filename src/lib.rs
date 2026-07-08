@@ -46,8 +46,10 @@ use soroban_sdk::{
     Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
-pub mod safe_math;
-use safe_math::SafeMath;
+// Test binaries link against std; expose format! and other std macros to all test modules.
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 // Issue #109 â€” Revenue report correction and audit-summary reconciliation are
 // implemented in this file. See `report_revenue`, `reconcile_audit_summary`,
@@ -175,19 +177,10 @@ pub enum RevoraError {
 
     /// The period has been sealed by `close_period`; no further overrides are accepted.
     ///
-    /// Wire value: 48. Stable since v1.
-    PeriodAlreadyClosed = 48,
+    /// Wire value: 51. Assigned after SnapshotHashMismatch=50 (48 was taken by VestingTransferBlocked).
+    PeriodAlreadyClosed = 51,
 
-    /// `faucet_seed_holders` was called while `testnet_mode == false`.
-    /// This function is strictly disallowed on mainnet.
-    ///
-    /// Wire value: 51.
-    TestnetOnly = 51,
-
-    /// Concentration staleness check failed: the stored concentration timestamp is
-    /// too old to enforce the configured limit safely.
-    ///
-    /// Wire value: 52.
+    /// Concentration data is stale beyond the configured max_staleness_secs window.
     StaleConcentrationData = 52,
 }
 
@@ -359,6 +352,10 @@ const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
 const EVENT_TYPE_REV_OMISS: Symbol = symbol_short!("rv_omiss");
 const EVENT_TYPE_REV_REP: Symbol = symbol_short!("rv_rep");
 const EVENT_TYPE_CLAIM: Symbol = symbol_short!("claim");
+/// Emitted via `EVENT_INDEXED_V2` whenever the per-offering accrual index advances.
+/// topic: `(ev_idx2, EventIndexTopicV2{event_type=acc_idx, ...})`
+/// data:  `(new_idx_e18: i128,)`
+const EVENT_TYPE_ACC_IDX: Symbol = symbol_short!("acc_idx");
 const EVENT_REPORT_WINDOW_SET: Symbol = symbol_short!("rep_win");
 const EVENT_CLAIM_WINDOW_SET: Symbol = symbol_short!("clm_win");
 const EVENT_META_SIGNER_SET: Symbol = symbol_short!("meta_key");
@@ -771,6 +768,18 @@ pub enum RoundingMode {
     RoundHalfUp = 1,
 }
 
+/// Tiered pause state for the contract.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseState {
+    /// All operations are open.
+    NotPaused = 0,
+    /// Reports and deposits are blocked; `claim` is still allowed.
+    SoftPaused = 1,
+    /// All state-mutating operations including `claim` are blocked.
+    HardPaused = 2,
+}
+
 /// Immutable record of a committed snapshot for an offering.
 ///
 /// A snapshot captures the canonical state of holder shares at a specific point in time,
@@ -999,17 +1008,18 @@ pub enum DataKey2 {
     /// Sealed-period flag: when present, `report_revenue` overrides are rejected for this period.
     ClosedPeriod(OfferingId, u64),
 
-    /// Per-offering supply cap in payment token units (#96). Zero means unlimited.
+    /// Offering supply cap in token units. 0 = unlimited.
     SupplyCap(OfferingId),
-    /// Cumulative revenue deposited for an offering across all periods.
+    /// Cumulative deposited revenue for an offering (used for supply-cap checks).
     DepositedRevenue(OfferingId),
-    /// Minimum reported revenue below which no distribution is triggered (#25).
+    /// Minimum revenue threshold below which a report is treated as a no-op.
     MinRevenueThreshold(OfferingId),
-    /// Per-offering investment constraints (min_stake, max_stake).
+    /// Per-offering investment stake constraints (min/max).
     InvestmentConstraints(OfferingId),
 
-    /// Testnet faucet: sha256-derived seed bytes for holder slot at the given index.
-    FaucetSeedEntry(OfferingId, u32),
+    /// Cumulative accrual index per offering in 1e18 fixed-point precision.
+    /// Advances by `(revenue * 1e18) / 10_000` on every accepted revenue report.
+    AccrualIndex(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1390,6 +1400,45 @@ impl RevoraRevenueShare {
 
     fn is_event_versioning_enabled(_env: Env) -> bool {
         true
+    }
+
+    /// Advance the cumulative accrual index for an offering and emit an `acc_idx` indexed event.
+    ///
+    /// The index accumulates `(amount * 1e18) / 10_000` per accepted revenue report, expressing
+    /// cumulative revenue in 1e18 fixed-point per basis-point of holder share. This lets
+    /// off-chain indexers reconstruct per-holder owed amounts without re-reading all periods.
+    ///
+    /// Skips silently when `amount == 0` (no-op report).
+    fn update_and_emit_accrual_index(
+        env: &Env,
+        offering_id: &OfferingId,
+        amount: i128,
+        period_id: u64,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        const E18: i128 = 1_000_000_000_000_000_000;
+        const BPS_MAX: i128 = 10_000;
+        let idx_key = DataKey2::AccrualIndex(offering_id.clone());
+        let current: i128 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+        let delta = amount.saturating_mul(E18).checked_div(BPS_MAX).unwrap_or(0);
+        let new_idx = current.saturating_add(delta);
+        env.storage().persistent().set(&idx_key, &new_idx);
+        env.events().publish(
+            (
+                EVENT_INDEXED_V2,
+                EventIndexTopicV2 {
+                    version: INDEXER_EVENT_SCHEMA_VERSION,
+                    event_type: EVENT_TYPE_ACC_IDX,
+                    issuer: offering_id.issuer.clone(),
+                    namespace: offering_id.namespace.clone(),
+                    token: offering_id.token.clone(),
+                    period_id,
+                },
+            ),
+            (new_idx,),
+        );
     }
 
     fn validate_window(window: &AccessWindow) -> Result<(), RevoraError> {
@@ -3856,6 +3905,12 @@ impl RevoraRevenueShare {
                 (EVENT_REV_REPA_V1, issuer, namespace, token),
                 (EVENT_SCHEMA_VERSION, payout_asset, amount, period_id),
             );
+        }
+
+        // Advance the cumulative accrual index. Skipped in event-only mode (no persistent state)
+        // and when amount == 0. Rejected duplicates (rv_rej) never reach this point (early return).
+        if !event_only {
+            Self::update_and_emit_accrual_index(&env, &offering_id, amount, period_id);
         }
 
         Ok(())

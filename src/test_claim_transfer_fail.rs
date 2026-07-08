@@ -188,7 +188,7 @@ fn pending_periods(
             offering_token.clone(),
             holder.clone(),
             0,
-            20,
+            200,
         );
         periods
     })
@@ -442,15 +442,15 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     // Register a second offering backed by a normal (unarmed) token so its claim succeeds.
     let offering_token_b = Address::generate(&env);
     let admin_b = Address::generate(&env);
-    let payout_asset_b = crate::test_utils::create_token(&env, &admin_b);
-    crate::test_utils::mint_tokens(&env, &payout_asset_b, &issuer, 100_000);
+    let payout_b = env.register_stellar_asset_contract(admin_b.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &payout_b).mint(&issuer, &1_000_000);
 
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &payout_asset_b,
+        &payout_b,
         &0,
         &None,
     );
@@ -462,7 +462,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &payout_asset_b,
+        &payout_b,
         &100_000,
         &1,
     );
