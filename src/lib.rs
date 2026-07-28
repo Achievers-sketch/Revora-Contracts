@@ -214,6 +214,7 @@ pub enum RevoraError {
 }
 
 pub mod vesting;
+pub mod tax_bucket;
 
 #[cfg(feature = "kani")]
 pub mod kani_harness;
@@ -6772,6 +6773,7 @@ impl RevoraRevenueShare {
             share_bps,
             Some(share_class),
         )
+        )
     }
 
     /// Open a formal on-chain dispute against an offering.
@@ -7348,6 +7350,10 @@ impl RevoraRevenueShare {
 
         if last_claimed_idx == start_idx {
             return Err(RevoraError::ClaimDelayNotElapsed);
+        }
+
+        if total_payout > 0 {
+            crate::tax_bucket::rollover_distribution(&env, &offering_id, &holder, total_payout);
         }
 
         // Transfer only if there is a positive payout
