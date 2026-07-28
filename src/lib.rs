@@ -115,6 +115,8 @@ pub enum RevoraError {
     DisplayDecimalsOutOfRange = 51,
     /// Total supply shares would exceed the offering's max total supply shares.
     MaxTotalSupplySharesExceeded = 58,
+    /// Total supply shares for a specific class would exceed the class cap.
+    ClassSupplyCapExceeded = 64,
     /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
     /// A transfer is already pending for this offering.
@@ -1121,6 +1123,10 @@ pub enum DataKey2 {
     TotalSharesIssued(OfferingId),
     /// Maximum total supply shares cap for an offering.
     MaxTotalSupplyShares(OfferingId),
+    /// Per-class supply cap.
+    PerClassSupplyCap(OfferingId, ShareClass),
+    /// Total shares issued for a specific class.
+    TotalClassSharesIssued(OfferingId, ShareClass),
     /// Per-entry faucet seed for testnet holder seeding.
     FaucetSeedEntry(OfferingId, u32),
 
@@ -1787,17 +1793,33 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
+        let old_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+            .unwrap_or(0);
+
+        // Check per-class supply cap BEFORE aggregate cap
+        if let Some(ref sc) = share_class {
+            let class_cap_key = DataKey2::PerClassSupplyCap(offering_id.clone(), sc.clone());
+            let class_cap: i128 = env.storage().persistent().get(&class_cap_key).unwrap_or(0);
+            if class_cap > 0 {
+                let class_shares_key = DataKey2::TotalClassSharesIssued(offering_id.clone(), sc.clone());
+                let current_class_shares: i128 = env.storage().persistent().get(&class_shares_key).unwrap_or(0);
+                let new_class_shares = current_class_shares.saturating_sub(old_share as i128).saturating_add(share_bps as i128);
+                if new_class_shares > class_cap {
+                    env.events().publish((Symbol::new(env, "class_cap_hit"), sc.clone()), new_class_shares);
+                    return Err(RevoraError::ClassSupplyCapExceeded);
+                }
+            }
+        }
+
         // Check max total supply shares cap
         let max_shares_key = DataKey2::MaxTotalSupplyShares(offering_id.clone());
         let max_shares: i128 = env.storage().persistent().get(&max_shares_key).unwrap_or(0);
         if max_shares > 0 {
             let total_shares_key = DataKey2::TotalSharesIssued(offering_id.clone());
             let current_total_shares: i128 = env.storage().persistent().get(&total_shares_key).unwrap_or(0);
-            let old_share: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
-                .unwrap_or(0);
             let new_total_shares = current_total_shares.saturating_sub(old_share as i128).saturating_add(share_bps as i128);
             if new_total_shares > max_shares {
                 return Err(RevoraError::MaxTotalSupplySharesExceeded);
@@ -1808,24 +1830,19 @@ impl RevoraRevenueShare {
         let total_key = DataKey::HolderShareTotal(offering_id.clone());
         let mut current_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
 
-        let classes: Option<Vec<(ShareClass, ClassConfig)>> =
-            env.storage().persistent().get(&DataKey2::OfferingClasses(offering_id.clone()));
+        let classes_key = DataKey2::OfferingClasses(offering_id.clone());
+        let classes: Option<Vec<(ShareClass, ClassConfig)>> = env.storage().persistent().get(&classes_key);
 
-        match classes {
-            Some(cls_vec) => {
-                let sc = match share_class {
-                    Some(sc) => sc,
-                    None => return Err(RevoraError::InvalidShareClass),
-                };
-                let mut found = false;
-                for (class_name, _) in cls_vec.iter() {
-                    if class_name == sc {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    return Err(RevoraError::InvalidShareClass);
+        if let Some(cls_vec) = classes {
+            let sc = match share_class {
+                Some(ref sc) => sc.clone(),
+                None => return Err(RevoraError::InvalidShareClass),
+            };
+            let mut found = false;
+            for (class_name, _) in cls_vec.iter() {
+                if class_name == sc {
+                    found = true;
+                    break;
                 }
             }
             None => {}
@@ -1847,6 +1864,13 @@ impl RevoraRevenueShare {
         let current_total_shares: i128 = env.storage().persistent().get(&total_shares_key).unwrap_or(0);
         let new_total_shares = current_total_shares.saturating_sub(old_share as i128).saturating_add(share_bps as i128);
         env.storage().persistent().set(&total_shares_key, &new_total_shares);
+
+        if let Some(ref sc) = share_class {
+            let class_shares_key = DataKey2::TotalClassSharesIssued(offering_id.clone(), sc.clone());
+            let current_class_shares: i128 = env.storage().persistent().get(&class_shares_key).unwrap_or(0);
+            let new_class_shares = current_class_shares.saturating_sub(old_share as i128).saturating_add(share_bps as i128);
+            env.storage().persistent().set(&class_shares_key, &new_class_shares);
+        }
 
         // Persist updated holder share and running total.
         env.storage()
@@ -2393,9 +2417,47 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&DataKey2::MaxTotalSupplyShares(offering_id)).unwrap_or(0)
     }
 
+    pub fn set_class_supply_cap(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        share_class: ShareClass,
+        cap: i128,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        if let Err((err, _)) =
+            AmountValidationMatrix::validate(cap, AmountValidationCategory::MaxTotalSupplyShares)
+        {
+            return Err(err);
+        }
+
+        let offering_id = OfferingId { issuer, namespace, token };
+        let class_cap_key = DataKey2::PerClassSupplyCap(offering_id, share_class);
+        if cap > 0 {
+            env.storage().persistent().set(&class_cap_key, &cap);
+        } else {
+            env.storage().persistent().remove(&class_cap_key);
+        }
+        Ok(())
+    }
+
+    pub fn get_class_supply_cap(env: Env, issuer: Address, namespace: Symbol, token: Address, share_class: ShareClass) -> i128 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::PerClassSupplyCap(offering_id, share_class)).unwrap_or(0)
+    }
+
     pub fn get_total_shares_issued(env: Env, issuer: Address, namespace: Symbol, token: Address) -> i128 {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&DataKey2::TotalSharesIssued(offering_id)).unwrap_or(0)
+    }
+
+    pub fn get_total_class_shares_issued(env: Env, issuer: Address, namespace: Symbol, token: Address, share_class: ShareClass) -> i128 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::TotalClassSharesIssued(offering_id, share_class)).unwrap_or(0)
     }
 
     // â”€â”€ Fee BPS Configuration (#98) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5721,21 +5783,6 @@ impl RevoraRevenueShare {
         // Zero-value transfer is meaningless
         if amount_bps == 0 {
             return Err(RevoraError::InvalidAmount);
-        }
-
-        // ── Guard: class transfer lock ────────────────────────────────────────
-        // Reject when `from` and `to` belong to different share classes unless a
-        // class-conversion primitive (not yet implemented) is in progress.
-        {
-            let from_class = Self::get_primary_class(env.clone(), offering_id.clone(), from.clone());
-            let to_class = Self::get_primary_class(env.clone(), offering_id.clone(), to.clone());
-            if from_class.is_some() && to_class.is_some() && from_class != to_class {
-                env.events().publish(
-                    (EVENT_CLASS_XFER_BLOCK, issuer, namespace.clone(), token.clone()),
-                    (from.clone(), to.clone(), from_class, to_class),
-                );
-                return Err(RevoraError::ClassTransferBlocked);
-            }
         }
 
         // Blacklist check
