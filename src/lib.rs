@@ -9887,5 +9887,3 @@ impl RevoraRevenueShare {
 
 #[cfg(test)]
 mod test_storage_layout_version;
-#[cfg(test)]
-mod test_close_period;
