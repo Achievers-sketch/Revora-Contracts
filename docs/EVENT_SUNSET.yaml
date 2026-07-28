@@ -1,0 +1,57 @@
+# EVENT_SUNSET.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Single source of truth for deprecated Revora contract event topics.
+#
+# PURPOSE
+#   Off-chain indexers, dashboards, and alerting pipelines read
+#   docs/EVENT_SUNSET.json (generated from this file) to know:
+#     - which event topics are deprecated
+#     - what replacement topic to use instead
+#     - when the deprecated topic will stop being emitted (sunset_epoch)
+#
+# SCHEMA (each entry under `deprecated_events`)
+#   topic         : string  — exact on-chain topic symbol (required, unique)
+#   deprecated_in : string  — contract version where deprecation was announced
+#                             (semver string, e.g. "v3")
+#   sunset_epoch  : integer — Soroban ledger sequence number after which this
+#                             topic will no longer be emitted (required; use
+#                             the earliest ledger of the planned upgrade)
+#   replacement   : string  — topic that replaces this one (required)
+#   note          : string  — human-readable migration guidance (optional)
+#
+# RULES
+#   1. Every entry MUST have a non-null `sunset_epoch`.  CI enforces this.
+#   2. `topic` values MUST be unique across all entries.  CI enforces this.
+#   3. Multiple deprecated topics MAY share the same `replacement`
+#      (e.g. both v1 and v2 topics replaced by v3).
+#   4. When a topic is actually removed, move it to the `removed_events`
+#      section below so the history is preserved.
+#
+# GENERATING THE JSON
+#   python3 scripts/generate_event_sunset_json.py
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+schema_version: 1
+
+# Active deprecations – topics still being dual-emitted but scheduled for removal.
+deprecated_events:
+
+  # ev_idx2 (V2 indexed event) is being superseded by ev_idx3 (V3).
+  # Both are currently emitted by emit_v2_and_v3(). V2 will stop being
+  # emitted two minor versions after V3 was introduced (per the deprecation
+  # policy in the README "Indexed Event Versioning" section).
+  - topic: ev_idx2
+    deprecated_in: "v3"
+    sunset_epoch: 3000000
+    replacement: ev_idx3
+    note: >
+      V2 indexed events carry 6-field topics (version, event_type, issuer,
+      namespace, token, period_id). V3 adds a `_reserved` field for future
+      additive schema evolution. Migrate indexers to subscribe to `ev_idx3`
+      and validate `version == 3`. Dual emission ends at sunset_epoch; after
+      that only ev_idx3 is emitted.
+
+# Historical record – topics that have already been removed.
+# Kept here so indexers that missed the transition window can detect the gap.
+removed_events: []
