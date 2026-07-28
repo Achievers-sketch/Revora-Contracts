@@ -238,6 +238,8 @@ mod test_close_period;
 mod test_disclosure;
 #[cfg(test)]
 mod test_quorum_check;
+#[cfg(test)]
+mod test_class_transfer_lock;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -385,6 +387,9 @@ const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
 /// Emitted when a share transfer with attestation occurs.
 const EVENT_XFER_ATT: Symbol = symbol_short!("xfer_att");
+/// Emitted when a cross-class share transfer is blocked.
+/// Data: `(offering_id, from, to, from_class, to_class)`.
+const EVENT_CLASS_XFER_BLOCK: Symbol = symbol_short!("cls_block");
 
 /// Emitted when a redemption window is set for an offering.
 const EVENT_REDEMPTION_WINDOW_SET: Symbol = symbol_short!("rdm_win");
@@ -5639,6 +5644,25 @@ impl RevoraRevenueShare {
 
         if from == to {
             return Ok(());
+
+        // Zero-value transfer is meaningless
+        if amount_bps == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        // ── Guard: class transfer lock ────────────────────────────────────────
+        // Reject when `from` and `to` belong to different share classes unless a
+        // class-conversion primitive (not yet implemented) is in progress.
+        {
+            let from_class = Self::get_primary_class(env.clone(), offering_id.clone(), from.clone());
+            let to_class = Self::get_primary_class(env.clone(), offering_id.clone(), to.clone());
+            if from_class.is_some() && to_class.is_some() && from_class != to_class {
+                env.events().publish(
+                    (EVENT_CLASS_XFER_BLOCK, issuer, namespace.clone(), token.clone()),
+                    (from.clone(), to.clone(), from_class, to_class),
+                );
+                return Err(RevoraError::ClassTransferBlocked);
+            }
         }
 
         // Blacklist check
