@@ -143,6 +143,17 @@ jobs:
       - name: Check storage layout JSON drift
         run: cargo test --test storage_layout_json storage_layout_json_matches_checked_in_docs -- --exact --test-threads=1
 
+      # Verify indexer/event_sunset.json is in sync with docs/EVENT_SUNSET.yaml.
+      # The generator validates every entry has a non-zero sunset_epoch and no
+      # chained deprecations.  Run locally: python3 scripts/gen_event_sunset.py
+      - name: Check event sunset JSON drift
+        run: python3 scripts/gen_event_sunset.py --check
+
+      # Validate the event sunset JSON is also covered by the Rust integration
+      # test (tests/event_sunset_json.rs).
+      - name: Test event sunset JSON (Rust integration)
+        run: cargo test --test event_sunset_json -- --test-threads=1
+
       # --test-threads=1 keeps Soroban test output deterministic.
       # Local command: cargo test -- --test-threads=1
       - name: Test
