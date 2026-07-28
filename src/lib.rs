@@ -524,10 +524,6 @@ const EVENT_ROUNDING_MODE_SET: Symbol = symbol_short!("rnd_mode");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("admin_set");
 /// Emitted when an admin rotation is logged to persistent history.
 const EVENT_ADMIN_ROTATION_LOGGED: Symbol = symbol_short!("adm_log");
-/// Emitted when a two-phase admin rotation is finalized (delay elapsed).
-const EVENT_ADMIN_FINALIZE: Symbol = symbol_short!("adm_fin");
-/// Emitted when the admin rotation delay is configured.
-const EVENT_ADMIN_ROTATION_DELAY_SET: Symbol = symbol_short!("adm_dly");
 const EVENT_PLATFORM_FEE_SET: Symbol = symbol_short!("fee_set");
 const EVENT_FRZ_SET: Symbol = symbol_short!("frz_set");
 const EVENT_FRZ_CLR: Symbol = symbol_short!("frz_clr");
@@ -1064,6 +1060,34 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
+/// Immutable record of a completed admin rotation, persisted in an append-only log.
+///
+/// Written once in `accept_admin_rotation` and read via `get_admin_rotation_history_page`.
+/// The log is bounded — see `MAX_ADMIN_ROTATION_LOG`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminRotationEntry {
+    /// Admin address before the rotation.
+    pub prior_admin: Address,
+    /// Admin address after the rotation.
+    pub new_admin: Address,
+    /// Ledger timestamp when `accept_admin_rotation` executed.
+    pub rotated_at: u64,
+}
+
+/// Tiered pause state for the contract.
+///
+/// - `NotPaused`  – all operations open.
+/// - `SoftPaused` – reports/deposits blocked; `claim` still allowed.
+/// - `HardPaused` – all state-mutating operations blocked, including `claim`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PauseState {
+    NotPaused,
+    SoftPaused,
+    HardPaused,
+}
+
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
 ///
@@ -1261,10 +1285,12 @@ pub enum DataKey2 {
     DepositedRevenue(OfferingId),
     /// Timestamp of the last faucet request for a requester address.
     FaucetLastRequest(Address),
-    /// Per-offering investment constraints (min/max stake).
-    InvestmentConstraints(OfferingId),
-    /// Per-offering supply cap (0 = uncapped).
-    SupplyCap(OfferingId),
+    /// Whether dual-signature close-of-period is enabled for this offering.
+    DualSigEnabled(OfferingId),
+    /// Append-only admin rotation log entry keyed by rotation_id (sequential counter).
+    AdminRotationLog(u64),
+    /// Monotonically increasing counter for admin rotation entries.
+    AdminRotationCount,
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1297,10 +1323,6 @@ const MAX_CHUNK_PERIODS: u32 = 200;
 /// Prevents unbounded storage growth. When the log reaches this limit, the oldest
 /// entries are evicted (FIFO) on each new rotation.
 const MAX_ADMIN_ROTATION_LOG: u64 = 100;
-
-/// Maximum number of entries in an oracle fallback chain.
-/// Keeps worst-case cross-contract call depth and gas usage bounded.
-const MAX_ORACLE_CHAIN_LEN: u32 = 10;
 
 // â”€â”€ Negative Amount Validation Matrix (#163) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -10012,7 +10034,7 @@ impl RevoraRevenueShare {
             env.storage().persistent().remove(&DataKey2::AdminRotationLog(evict_id));
         }
 
-        env.events().publish((EVENT_ADMIN_FINALIZE, old_admin), new_admin);
+        env.events().publish((symbol_short!("adm_acc"), old_admin), new_admin);
         Self::emit_v2_event(&env, (EVENT_ADMIN_ROTATION_LOGGED,), entry);
 
         Ok(())
@@ -10068,36 +10090,6 @@ impl RevoraRevenueShare {
     /// None â€” read-only.
     pub fn get_pending_admin_rotation_details(env: Env) -> Option<PendingAdminRotation> {
         env.storage().persistent().get(&DataKey::PendingAdmin)
-    }
-
-    /// Configure the mandatory delay (in seconds) that must elapse between
-    /// [`propose_admin_rotation`] and [`finalize_admin_rotation`].
-    ///
-    /// Once set, any new proposal must wait at least `delay_secs` before the rotation
-    /// can be finalized. The delay applies to proposals made **after** it is configured.
-    /// Set to 0 to disable the delay (immediate finalization, default behavior).
-    ///
-    /// ### Auth
-    /// Current admin (`require_auth`).
-    ///
-    /// ### Events
-    /// Emits `adm_dly`: `(adm_dly, admin)` â†’ `delay_secs`.
-    pub fn set_admin_rotation_delay(env: Env, delay_secs: u64) -> Result<(), RevoraError> {
-        let admin: Address =
-            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
-        admin.require_auth();
-
-        env.storage().persistent().set(&DataKey2::AdminRotationDelay, &delay_secs);
-        env.events().publish((EVENT_ADMIN_ROTATION_DELAY_SET, admin), delay_secs);
-        Ok(())
-    }
-
-    /// Return the configured admin rotation delay in seconds, or 0 if not set.
-    ///
-    /// ### Auth
-    /// None â€” read-only.
-    pub fn get_admin_rotation_delay(env: Env) -> u64 {
-        env.storage().persistent().get(&DataKey2::AdminRotationDelay).unwrap_or(0u64)
     }
 
     /// Return a page of the append-only admin rotation history log.
