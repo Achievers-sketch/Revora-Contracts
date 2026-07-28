@@ -224,7 +224,9 @@ pub enum RevoraError {
     /// Approver has already approved this proposal.
     AlreadyApproved = 46,
     /// The requester is still within the faucet cooldown window.
-    FaucetCooldownActive = 37,
+    FaucetCooldownActive = 56,
+    /// Total supply shares would exceed the offering's max total supply shares.
+    MaxTotalSupplySharesExceeded = 51,
 
     /// override_existing=true was requested but no persisted report exists for the given period_id.
     MissingReportForOverride = 47,
@@ -304,6 +306,10 @@ mod test_claim_transfer_fail;
 mod test_compute_share_invariants;
 #[cfg(test)]
 mod test_duplicates;
+#[cfg(test)]
+mod test_governance_proposals;
+#[cfg(test)]
+mod test_time_windows;
 mod test_event_indexed_v2;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
@@ -348,8 +354,6 @@ const EVENT_REVENUE_REPORT_MISSING_OVERRIDE: Symbol = symbol_short!("rev_omiss")
 const EVENT_REVENUE_REPORT_REJECTED_ASSET: Symbol = symbol_short!("rev_reja");
 pub const EVENT_SCHEMA_VERSION_V2: u32 = 2;
 const DEFAULT_FAUCET_COOLDOWN_SECONDS: u64 = 3_600;
-/// Default dispute window: 30 days in seconds.
-const DEFAULT_DISPUTE_WINDOW_SECS: u64 = 2_592_000;
 
 // Versioned event symbols (v2). All core events emit with leading `version` field.
 const EVENT_OFFER_REG_V2: Symbol = symbol_short!("ofr_reg2");
@@ -375,6 +379,7 @@ const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
 const EVENT_PROPOSAL_EXECUTED_V2: Symbol = symbol_short!("prop_e2");
 const EVENT_PROPOSAL_APPROVED: Symbol = symbol_short!("prop_app");
 const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
+const EVENT_PROPOSAL_CREATED_GOV: Symbol = symbol_short!("prop_create");
 const EVENT_DURATION_SET: Symbol = symbol_short!("dur_set");
 
 #[contracttype]
@@ -401,6 +406,24 @@ pub struct Proposal {
     /// The sum of `voter_weight_bps` of all approvals must meet or exceed this.
     pub quorum_bps: u32,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovernanceProposal {
+    pub id: u32,
+    pub meta_hash: BytesN<32>,
+    pub quorum_bps: u32,
+    pub ends_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseState {
+    NotPaused = 0,
+    SoftPaused = 1,
+    HardPaused = 2,
+}
+
 
 const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 
@@ -1222,66 +1245,23 @@ pub enum DataKey2 {
     /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
     DisclosureMeta(OfferingId),
 
+    /// Governance proposal count scoped to an offering.
+    GovernanceProposalCount(OfferingId),
+    /// Governance proposal payload keyed by (offering_id, proposal_id).
+    GovernanceProposal(OfferingId, u32),
+    /// Duplicate meta-hash guard keyed by (offering_id, meta_hash).
+    GovernanceProposalMeta(OfferingId, BytesN<32>),
+
+    /// Per-offering minimum revenue threshold below which reports are skipped.
+    MinRevenueThreshold(OfferingId),
+    /// Per-offering cumulative deposited revenue tracker.
+    DepositedRevenue(OfferingId),
     /// Timestamp of the last faucet request for a requester address.
     FaucetLastRequest(Address),
-    /// Whether dual-signature close-of-period is enabled for this offering.
-    DualSigEnabled(OfferingId),
-    /// Global freeze reason recorded during set_freeze (#605).
-    GlobalFreezeReason,
-
-    // ── Missing variants added for compilation ──
-    /// Current accrual index counter for dividend-accrual ledger.
-    AccrualIndex(OfferingId),
-    /// Per-offering platform fee model.
-    OfferingPlatformFee(OfferingId),
-    /// Denomination metadata (symbol, decimals) for an offering.
-    DenominationMetadata(OfferingId),
-    /// FX oracle configuration for an offering.
-    FxOracleConfig(OfferingId),
-    /// Transfer restrictions per category for an offering.
-    TransferRestrictions(OfferingId, Symbol),
-    /// Holder category tag for transfer restriction purposes.
-    HolderCategory(OfferingId, Address),
-    /// Per-category holder count for transfer restriction accounting.
-    CategoryHolderCount(OfferingId, Symbol),
-    /// Emergency freeze record for (offering_id, holder).
-    EmergencyFreeze(OfferingId, Address),
-    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
-    TotalSharesIssued(OfferingId),
-    /// Maximum total supply shares cap for an offering.
-    MaxTotalSupplyShares(OfferingId),
-    /// Per-entry faucet seed for testnet holder seeding.
-    FaucetSeedEntry(OfferingId, u32),
-
-    // ── Multisig keys ──
-    /// Multisig approval threshold.
-    MultisigThreshold,
-    /// Multisig owner list.
-    MultisigOwners,
-    /// Multisig proposal counter.
-    MultisigProposalCount,
-    /// Default proposal duration in seconds.
-    MultisigProposalDuration,
-    /// Multisig proposal by id.
-    MultisigProposal(u32),
-    /// Per-owner voting weight in basis points.
-    VoterWeight(Address),
-    /// Global quorum threshold in basis points.
-    MultisigQuorumBps,
-
-    // ── Governance keys (issue #557) ──
-    /// Per-offering governance proposal counter.
-    GovProposalCount(OfferingId),
-    /// Per-offering governance proposal by id.
-    GovProposal(OfferingId, u32),
-    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
-    VoteRecord(OfferingId, u32, Address),
-
-    // ── Oracle chain (issue #547) ──
-    /// Ordered oracle fallback chain for cross-currency FX conversion.
-    /// When a `report_revenue` call needs an FX rate, entries are tried in order
-    /// and the first non-stale quote is used.
-    OracleChain(OfferingId),
+    /// Per-offering investment constraints (min/max stake).
+    InvestmentConstraints(OfferingId),
+    /// Per-offering supply cap (0 = uncapped).
+    SupplyCap(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -8207,34 +8187,7 @@ impl RevoraRevenueShare {
     ///
     /// # Events
 
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic (#38).
-    pub fn get_pending_periods(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        holder: Address,
-    ) -> Vec<u64> {
-        let offering_id = OfferingId { issuer, namespace, token };
-        let count_key = DataKey::PeriodCount(offering_id.clone());
-        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
-        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
-
-        let mut periods = Vec::new(&env);
-        for i in start_idx..period_count {
-            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
-            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-            if period_id == 0 {
-                continue;
-            }
-            periods.push_back(period_id);
-        }
-        periods
-    }
-
+    /// Claim pending share payouts for a holder on an offering.
     pub fn claim(
         env: Env,
         holder: Address,
@@ -10600,6 +10553,76 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Create a governance proposal bound to an offering and an issuer-authenticated metadata hash.
+    ///
+    /// The proposal id is deterministic per offering and increments from a per-offering counter.
+    /// The entrypoint is issuer-authenticated so the on-chain record is bound to the issuer's
+    /// signed transaction and can be audited off-chain.
+    pub fn create_proposal(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        meta_hash: BytesN<32>,
+        quorum_bps: u32,
+        voting_window: u64,
+    ) -> Result<u32, RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        if quorum_bps == 0 || quorum_bps > 10_000 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        if voting_window == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        if env.storage().persistent().has(&DataKey2::GovernanceProposalMeta(offering_id.clone(), meta_hash.clone())) {
+            return Err(RevoraError::LimitReached);
+        }
+
+        let count_key = DataKey2::GovernanceProposalCount(offering_id.clone());
+        let proposal_id: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let ends_at = env.ledger().timestamp().checked_add(voting_window).ok_or(RevoraError::InvalidAmount)?;
+        let proposal = GovernanceProposal {
+            id: proposal_id,
+            meta_hash: meta_hash.clone(),
+            quorum_bps,
+            ends_at,
+        };
+
+        env.storage().persistent().set(&DataKey2::GovernanceProposal(offering_id.clone(), proposal_id), &proposal);
+        env.storage().persistent().set(&count_key, &(proposal_id + 1));
+        env.storage().persistent().set(&DataKey2::GovernanceProposalMeta(offering_id.clone(), meta_hash.clone()), &true);
+        env.events().publish(
+            (EVENT_PROPOSAL_CREATED_GOV, issuer.clone(), namespace.clone(), token.clone()),
+            (proposal_id, meta_hash, quorum_bps, ends_at),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Return a previously created governance proposal for an offering.
+    pub fn get_proposal(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        proposal_id: u32,
+    ) -> Option<GovernanceProposal> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey2::GovernanceProposal(offering_id, proposal_id))
+    }
+
     /// Propose a sensitive administrative action.
     /// The proposer's address is automatically counted as the first approval.
     pub fn propose_action(
@@ -10862,8 +10885,10 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-        let last_request_ts: Option<u64> =
-            env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
@@ -10880,7 +10905,9 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.storage().persistent().set(&DataKey2::FaucetLastRequest(requester), &now);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));
