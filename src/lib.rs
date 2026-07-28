@@ -180,8 +180,6 @@ pub enum RevoraError {
     AlreadyApproved = 46,
     /// The requester is still within the faucet cooldown window.
     FaucetCooldownActive = 59,
-    /// Total supply shares would exceed the offering's max total supply shares.
-    MaxTotalSupplySharesExceeded = 58,
 
     /// override_existing=true was requested but no persisted report exists for the given period_id.
     MissingReportForOverride = 47,
@@ -305,8 +303,6 @@ pub enum ProposalAction {
     RemoveOwner(Address),
     SetProposalDuration(u64),
 }
-
-// Duplicate PauseState removed - using canonical definition at line ~818
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -845,6 +841,7 @@ pub enum MetaDataKey {
     RevenueApproved(OfferingId, u64),
 }
 
+
 /// Defines how fractional shares are handled during distribution calculations.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -854,6 +851,7 @@ pub enum RoundingMode {
     /// Standard rounding: share = round((amount * bps) / 10000), where >= 0.5 rounds up.
     RoundHalfUp = 1,
 }
+
 
 /// Immutable record of a committed snapshot for an offering.
 ///
@@ -884,32 +882,6 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
-/// An on-chain governance proposal whose voting weight is pinned to the snapshot
-/// taken at the moment of proposal creation (issue #557).
-///
-/// # Security
-/// The `snapshot_id` field is written once at creation time and is immutable.
-/// `cast_vote` reads the voter's weight exclusively from that snapshot, preventing
-/// any late-buy vote manipulation after proposal creation.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct GovProposalEntry {
-    /// Auto-incremented proposal identifier (0-indexed per offering).
-    pub id: u32,
-    /// Human-readable proposal description (max 256 bytes, caller-supplied).
-    pub description: Symbol,
-    /// The snapshot_ref pinned at proposal creation. All vote-weight lookups
-    /// use this snapshot exclusively.
-    pub snapshot_id: u64,
-    /// Ledger timestamp when the proposal was created.
-    pub created_at: u64,
-    /// Cumulative yes-weight in basis points.
-    pub yes_weight: u32,
-    /// Cumulative no-weight in basis points.
-    pub no_weight: u32,
-    /// Whether the proposal is still open for voting.
-    pub open: bool,
-}
 
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
@@ -1089,6 +1061,8 @@ pub enum DataKey2 {
     FaucetLastRequest(Address),
     /// Whether dual-signature close-of-period is enabled for this offering.
     DualSigEnabled(OfferingId),
+    /// Global freeze reason recorded during set_freeze (#605).
+    GlobalFreezeReason,
 
     // ── Missing variants added for compilation ──
 
