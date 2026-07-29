@@ -115,31 +115,22 @@ const CORE_LAYOUT: &[StorageLayoutEntry] = storage_layout_entries!("revora_reven
     ("DataKey2::DisclosureMeta(OfferingId)", "DisclosureMeta", "offering"),
     ("DataKey2::FaucetLastRequest(Address)", "u64", "address"),
     ("DataKey2::DualSigEnabled(OfferingId)", "bool", "offering"),
-    ("DataKey2::GlobalFreezeReason", "FreezeReason", "contract"),
-    ("DataKey2::AccrualIndex(OfferingId)", "u64", "offering"),
-    ("DataKey2::OfferingPlatformFee(OfferingId)", "PlatformFeeModel", "offering"),
-    ("DataKey2::DenominationMetadata(OfferingId)", "DenominationMetadata", "offering"),
-    ("DataKey2::FxOracleConfig(OfferingId)", "FxOracleConfig", "offering"),
-    ("DataKey2::TransferRestrictions(OfferingId, Symbol)", "TransferRestrictions", "offering+category"),
-    ("DataKey2::HolderCategory(OfferingId, Address)", "Symbol", "offering+holder"),
-    ("DataKey2::CategoryHolderCount(OfferingId, Symbol)", "u32", "offering+category"),
-    ("DataKey2::EmergencyFreeze(OfferingId, Address)", "bool", "offering+holder"),
-    ("DataKey2::TotalSharesIssued(OfferingId)", "i128", "offering"),
-    ("DataKey2::MaxTotalSupplyShares(OfferingId)", "i128", "offering"),
-    ("DataKey2::FaucetSeedEntry(OfferingId, u32)", "Address", "offering+index"),
-    ("DataKey2::ClassConversionRatio(OfferingId, ShareClass, ShareClass)", "u32", "offering+class"),
+    ("DataKey2::AdminRotationLog(u64)", "AdminRotationEntry", "contract"),
+    ("DataKey2::AdminRotationCount", "u64", "contract"),
+    // Legacy multisig/voter-weight entries were intentionally removed: the
+    // source enums `DataKey2::{MultisigOwners,MultisigProposal*,MultisigThreshold,
+    // MultisigQuorumBps,VoterWeight}` and `DataKey2::AdminRotationDelay` no longer
+    // exist in src/lib.rs. Keeping stale rows here would re-trigger the
+    // storage-layout registry drift check at every build.
+    ("DataKey2::ClassConversionRatio(OfferingId, ShareClass, ShareClass)", "u32", "offering+class+class"),
+    ("DataKey2::EmitV2Compat", "bool", "contract"),
+    ("DataKey2::GovernanceProposalCount(OfferingId)", "u32", "offering"),
+    ("DataKey2::GovernanceProposal(OfferingId, u32)", "GovernanceProposal", "offering+proposal"),
+    ("DataKey2::GovernanceProposalMeta(OfferingId, BytesN<32>)", "bool", "offering+meta"),
     ("DataKey2::OraclePubKey(Address)", "BytesN<32>", "address"),
-    ("DataKey2::GovProposalCount(OfferingId)", "u32", "offering"),
-    ("DataKey2::GovProposal(OfferingId, u32)", "GovProposal", "offering+proposal"),
-    ("DataKey2::VoteRecord(OfferingId, u32, Address)", "bool", "offering+proposal+voter"),
-    ("DataKey2::MultisigOwners", "Vec<Address>", "contract"),
-    ("DataKey2::MultisigThreshold", "u32", "contract"),
-    ("DataKey2::MultisigProposalCount", "u32", "contract"),
-    ("DataKey2::MultisigProposalDuration", "u64", "contract"),
-    ("DataKey2::MultisigProposal(u32)", "GovernanceProposal", "proposal"),
     ("DataKey::SnapshotHolderShare(OfferingId, u64, Address)", "u32", "offering+snapshot+holder"),
-    ("MigrationDataKey::LastMigrationCompletedAt(Address)", "u32", "issuer"),
-    ("MigrationDataKey::MigrationResumeCursor(Address)", "MigrationCursor", "issuer")
+    ("MigrationDataKey::MigrationResumeCursor(Address)", "MigrationCursor", "issuer"),
+    ("MigrationDataKey::LastMigrationCompletedAt(Address)", "u32", "issuer")
 ]);
 
 const REVENUE_DEPOSIT_LAYOUT: &[StorageLayoutEntry] = storage_layout_entries!("revenue_deposit_contract", [
