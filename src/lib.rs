@@ -155,9 +155,7 @@ pub enum RevoraError {
     /// `display_decimals` exceeds the maximum allowed precision of 18.
     ///
     /// Wire value: 51. Stable since v1.
-    DisplayDecimalsOutOfRange = 51,
-    /// Total supply shares would exceed the offering's max total supply shares.
-    MaxTotalSupplySharesExceeded = 34,
+    DisplayDecimalsOutOfRange = 34,
     /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
     /// A transfer is already pending for this offering.
@@ -219,7 +217,7 @@ pub enum RevoraError {
     /// Admin rotation failed: caller is not the pending new admin.
     UnauthorizedRotationAccept = 36,
     /// Admin rotation failed: the configured delay has not elapsed since the proposal.
-    AdminRotationDelayNotElapsed = 58,
+    AdminRotationDelayNotElapsed = 37,
     /// Offering is frozen.
     OfferingFrozen = 42,
     /// Issuer transfer has expired.
@@ -233,7 +231,7 @@ pub enum RevoraError {
     /// Approver has already approved this proposal.
     AlreadyApproved = 46,
     /// The requester is still within the faucet cooldown window.
-    FaucetCooldownActive = 56,
+    FaucetCooldownActive = 38,
     /// Total supply shares would exceed the offering's max total supply shares.
     MaxTotalSupplySharesExceeded = 67,
 
@@ -285,7 +283,10 @@ pub mod tax_bucket;
 /// security notes.
 pub mod merkle_helpers;
 
-#[cfg(any(feature = "kani", test))]
+/// Security assertion helpers for production validation.
+pub mod security_assertions;
+
+#[cfg(feature = "kani")]
 pub mod kani_harness;
 
 #[cfg(test)]
@@ -311,6 +312,8 @@ mod test_close_period;
 mod test_disclosure;
 #[cfg(test)]
 mod test_quorum_check;
+#[cfg(test)]
+mod test_ofac_snapshot_pin;
 /// Self-test module providing a `self_test()` entrypoint that runs contract-internal
 #[cfg(test)]
 mod test_self_test;
@@ -320,6 +323,7 @@ pub mod self_test;
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
 const EVENT_BL_ADD: Symbol = symbol_short!("bl_add");
+const EVENT_BL_ADD_PINNED: Symbol = symbol_short!("bl_add_pn");
 const EVENT_BL_REM: Symbol = symbol_short!("bl_rem");
 const EVENT_WL_ADD: Symbol = symbol_short!("wl_add");
 const EVENT_WL_REM: Symbol = symbol_short!("wl_rem");
@@ -370,7 +374,7 @@ const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
 const EVENT_PROPOSAL_EXECUTED_V2: Symbol = symbol_short!("prop_e2");
 const EVENT_PROPOSAL_APPROVED: Symbol = symbol_short!("prop_app");
 const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
-const EVENT_PROPOSAL_CREATED_GOV: Symbol = symbol_short!("prop_create");
+const EVENT_PROPOSAL_CREATED_GOV: Symbol = symbol_short!("prop_crt");
 const EVENT_DURATION_SET: Symbol = symbol_short!("dur_set");
 
 #[contracttype]
@@ -701,6 +705,20 @@ pub struct SanctionsAttestation {
     pub source: Source,
     pub ref_id: Symbol,
     pub attested_at: u64,
+}
+
+/// Metadata for a blacklist entry that was pinned to an OFAC snapshot hash.
+///
+/// Stored alongside the `SanctionsAttestation` when an entry is added via
+/// `blacklist_add_pinned`. Enables compliance verification by linking each
+/// blacklist entry to a specific signed off-chain snapshot of the OFAC list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlacklistEntryMeta {
+    /// SHA-256 hash of the signed off-chain OFAC list snapshot.
+    pub snapshot_hash: BytesN<32>,
+    /// Ledger timestamp when the blacklist entry was created.
+    pub added_ts: u64,
 }
 
 #[contracttype]
@@ -1085,6 +1103,21 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
+/// Immutable record of a completed admin rotation, persisted in an append-only log.
+///
+/// Written once in `accept_admin_rotation` and read via `get_admin_rotation_history_page`.
+/// The log is bounded — see `MAX_ADMIN_ROTATION_LOG`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminRotationEntry {
+    /// Admin address before the rotation.
+    pub prior_admin: Address,
+    /// Admin address after the rotation.
+    pub new_admin: Address,
+    /// Ledger timestamp when `accept_admin_rotation` executed.
+    pub rotated_at: u64,
+}
+
 /// Primary storage keys for core contract state.
 /// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
 ///
@@ -1102,6 +1135,8 @@ pub(crate) enum DataKey {
     Whitelist(OfferingId),
     /// Per-offering: blacklist addresses in insertion order for deterministic get_blacklist (#38).
     BlacklistOrder(OfferingId),
+    /// Per-offering: metadata for blacklist entries pinned to an OFAC snapshot hash.
+    BlacklistMeta(OfferingId),
     OfferCount(TenantId),
     OfferItem(TenantId, u32),
     /// Per-offering concentration limit config.
@@ -1291,10 +1326,13 @@ pub enum DataKey2 {
     /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
     DisclosureMeta(OfferingId),
 
-    /// Per-offering minimum revenue threshold below which reports are skipped.
-    MinRevenueThreshold(OfferingId),
-    /// Per-offering cumulative deposited revenue tracker.
-    DepositedRevenue(OfferingId),
+    /// Governance proposal count scoped to an offering.
+    GovernanceProposalCount(OfferingId),
+    /// Governance proposal payload keyed by (offering_id, proposal_id).
+    GovernanceProposal(OfferingId, u32),
+    /// Duplicate meta-hash guard keyed by (offering_id, meta_hash).
+    GovernanceProposalMeta(OfferingId, BytesN<32>),
+
     /// Timestamp of the last faucet request for a requester address.
     FaucetLastRequest(Address),
     /// Whether dual-signature close-of-period is enabled for this offering.
@@ -1756,7 +1794,7 @@ impl RevoraRevenueShare {
     }
 
     /// Require that a holder is not emergency frozen.
-    fn require_not_frozen(
+    fn require_holder_not_frozen(
         env: &Env,
         offering_id: &OfferingId,
         holder: &Address,
@@ -2125,7 +2163,9 @@ impl RevoraRevenueShare {
                     break;
                 }
             }
-            None => {}
+            if !found {
+                return Err(RevoraError::InvalidShareClass);
+            }
         }
 
         let new_total =
@@ -5309,6 +5349,11 @@ impl RevoraRevenueShare {
     }
 
     /// Helper function to add an investor to the blacklist with attestation.
+    ///
+    /// Accepts an optional `BlacklistEntryMeta` that, when provided, is persisted
+    /// in a separate `BlacklistMeta` map keyed by `(offering_id, investor)`.
+    /// This enables compliance verification by linking blacklist entries to
+    /// signed off-chain OFAC snapshot hashes.
     fn do_blacklist_add(
         env: Env,
         caller: Address,
@@ -5317,6 +5362,7 @@ impl RevoraRevenueShare {
         token: Address,
         investor: Address,
         attestation: SanctionsAttestation,
+        entry_meta: Option<BlacklistEntryMeta>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
@@ -5364,6 +5410,18 @@ impl RevoraRevenueShare {
                 map.set(investor.clone(), attestation.clone());
                 env.storage().persistent().set(&key, &map);
 
+                // If BlacklistEntryMeta was provided, persist it in the BlacklistMeta map
+                if let Some(ref meta) = entry_meta {
+                    let meta_key = DataKey::BlacklistMeta(offering_id.clone());
+                    let mut meta_map: Map<Address, BlacklistEntryMeta> = env
+                        .storage()
+                        .persistent()
+                        .get(&meta_key)
+                        .unwrap_or_else(|| Map::new(&env));
+                    meta_map.set(investor.clone(), meta.clone());
+                    env.storage().persistent().set(&meta_key, &meta_map);
+                }
+
                 // Maintain insertion order for deterministic get_blacklist (#38)
                 let order_key = DataKey::BlacklistOrder(offering_id.clone());
                 let mut order: Vec<Address> =
@@ -5373,8 +5431,16 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.events()
-            .publish((EVENT_BL_ADD, issuer, namespace, token), (caller, investor, attestation));
+        // Emit the appropriate event based on whether a snapshot hash was provided
+        if let Some(meta) = entry_meta {
+            env.events().publish(
+                (EVENT_BL_ADD_PINNED, issuer, namespace, token),
+                (caller, investor, attestation, meta.snapshot_hash),
+            );
+        } else {
+            env.events()
+                .publish((EVENT_BL_ADD, issuer, namespace, token), (caller, investor, attestation));
+        }
         Ok(())
     }
 
@@ -5414,7 +5480,67 @@ impl RevoraRevenueShare {
         investor: Address,
         attestation: SanctionsAttestation,
     ) -> Result<(), RevoraError> {
-        Self::do_blacklist_add(env, caller, issuer, namespace, token, investor, attestation)
+        Self::do_blacklist_add(env, caller, issuer, namespace, token, investor, attestation, None)
+    }
+
+    /// Add an investor to the per-offering blacklist, pinned to a signed OFAC snapshot hash.
+    ///
+    /// Compliance requires proving which OFAC list version informed each blacklist entry.
+    /// This variant binds every `blacklist_add` call to a signed off-chain snapshot hash
+    /// referencing the source list. The snapshot hash and addition timestamp are persisted
+    /// alongside the attestation for verifiable compliance audits.
+    ///
+    /// ### Parameters
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer or admin.
+    /// - `issuer`: The issuer address of the offering.
+    /// - `namespace`: The namespace of the offering.
+    /// - `token`: The token representing the offering.
+    /// - `investor`: The address to be blacklisted.
+    /// - `attestation`: The sanctions attestation containing source, reference ID, and timestamp.
+    /// - `ofac_snapshot_hash`: SHA-256 hash of the signed off-chain OFAC list snapshot.
+    ///
+    /// ### Events
+    /// Publishes `(EVENT_BL_ADD_PINNED, issuer, namespace, token)` with
+    /// `(caller, investor, attestation, snapshot_hash)` as the event data.
+    ///
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering or the contract admin.
+    /// - The blacklist is capped at `MAX_BLACKLIST_SIZE` entries per offering.
+    /// - Idempotent adds (address already present) do not count against the size limit.
+    /// - `attestation.attested_at` must not be in the future.
+    ///
+    /// ### Returns
+    /// - `Ok(())` on success.
+    /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer or admin.
+    /// - `Err(RevoraError::BlacklistSizeLimitExceeded)` if the blacklist is at capacity.
+    /// - `Err(RevoraError::InvalidAmount)` if attestation timestamp is in the future.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blacklist_add_pinned(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        investor: Address,
+        attestation: SanctionsAttestation,
+        ofac_snapshot_hash: BytesN<32>,
+    ) -> Result<(), RevoraError> {
+        // Build the entry meta with the snapshot hash and current timestamp
+        let entry_meta = BlacklistEntryMeta {
+            snapshot_hash: ofac_snapshot_hash,
+            added_ts: env.ledger().timestamp(),
+        };
+        Self::do_blacklist_add(
+            env,
+            caller,
+            issuer,
+            namespace,
+            token,
+            investor,
+            attestation,
+            Some(entry_meta),
+        )
     }
 
     /// Add an investor to the per-offering blacklist (legacy, uses Source::Manual).
@@ -5451,7 +5577,7 @@ impl RevoraRevenueShare {
             ref_id: symbol_short!("manual"),
             attested_at: env.ledger().timestamp(),
         };
-        Self::do_blacklist_add(env, caller, issuer, namespace, token, investor, attestation)
+        Self::do_blacklist_add(env, caller, issuer, namespace, token, investor, attestation, None)
     }
 
     /// Add multiple investors to the per-offering blacklist in a single transaction (uses Source::Manual).
@@ -5647,6 +5773,16 @@ impl RevoraRevenueShare {
         map.remove(investor.clone());
         env.storage().persistent().set(&key, &map);
 
+        // Also clean up the BlacklistMeta map if this entry had a pinned snapshot hash
+        let meta_key = DataKey::BlacklistMeta(offering_id.clone());
+        let mut meta_map: Map<Address, BlacklistEntryMeta> = env
+            .storage()
+            .persistent()
+            .get(&meta_key)
+            .unwrap_or_else(|| Map::new(&env));
+        meta_map.remove(investor.clone());
+        env.storage().persistent().set(&meta_key, &meta_map);
+
         // Rebuild order vec so get_blacklist stays deterministic (#38)
         let order_key = DataKey::BlacklistOrder(offering_id.clone());
         let old_order: Vec<Address> =
@@ -5735,6 +5871,14 @@ impl RevoraRevenueShare {
         let mut map: Map<Address, SanctionsAttestation> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
+        // Also load the BlacklistMeta map for cleanup
+        let meta_key = DataKey::BlacklistMeta(offering_id.clone());
+        let mut meta_map: Map<Address, BlacklistEntryMeta> = env
+            .storage()
+            .persistent()
+            .get(&meta_key)
+            .unwrap_or_else(|| Map::new(&env));
+
         // Task 3.4: Deduplication logic
         let mut seen = Map::new(&env);
         let mut unique_investors = Vec::new(&env);
@@ -5754,6 +5898,9 @@ impl RevoraRevenueShare {
             if was_present {
                 // Remove from map
                 map.remove(investor.clone());
+
+                // Also clean up the BlacklistMeta entry if present
+                meta_map.remove(investor.clone());
 
                 // Emit event for actual state change
                 env.events().publish(
@@ -5779,6 +5926,7 @@ impl RevoraRevenueShare {
         // Save updated storage
         env.storage().persistent().set(&key, &map);
         env.storage().persistent().set(&order_key, &new_order);
+        env.storage().persistent().set(&meta_key, &meta_map);
 
         Ok(())
     }
@@ -5918,6 +6066,36 @@ impl RevoraRevenueShare {
             .get::<DataKey, Map<Address, SanctionsAttestation>>(&key)
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    /// Returns the `BlacklistEntryMeta` for a blacklisted investor, if one exists.
+    ///
+    /// Only entries added via `blacklist_add_pinned` will have metadata.
+    /// Returns `None` if the investor is not blacklisted or was added without a snapshot hash.
+    ///
+    /// ### Parameters
+    /// - `env`: The Soroban environment.
+    /// - `issuer`: The issuer address of the offering.
+    /// - `namespace`: The namespace of the offering.
+    /// - `token`: The token representing the offering.
+    /// - `investor`: The blacklisted address to query.
+    ///
+    /// ### Returns
+    /// - `Some(BlacklistEntryMeta)` containing the snapshot hash and addition timestamp.
+    /// - `None` if no pinned metadata exists for the investor.
+    pub fn get_blacklist_entry_meta(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        investor: Address,
+    ) -> Option<BlacklistEntryMeta> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let meta_key = DataKey::BlacklistMeta(offering_id);
+        env.storage()
+            .persistent()
+            .get::<DataKey, Map<Address, BlacklistEntryMeta>>(&meta_key)
+            .and_then(|m| m.get(investor))
     }
 
     // â”€â”€ Whitelist management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -6337,6 +6515,7 @@ impl RevoraRevenueShare {
 
         if from == to {
             return Ok(());
+        }
 
         // Zero-value transfer is meaningless
         if amount_bps == 0 {
@@ -7673,7 +7852,6 @@ impl RevoraRevenueShare {
             Some(share_class),
             None,
         )
-        )
     }
     ///
     /// The dispute ID is deterministic: `sha256(issuer || namespace || token || holder || meta_hash)`.
@@ -7945,7 +8123,7 @@ impl RevoraRevenueShare {
         }
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("class_conv"), offering_id, holder),
+            (soroban_sdk::symbol_short!("class_cnv"), offering_id, holder),
             (from_class, from_balance, new_from, to_class, to_balance, new_to),
         );
 
@@ -8644,38 +8822,6 @@ impl RevoraRevenueShare {
         )
     }
 
-    /// Configure the reporting access window for an offering. If unset, always open.
-    pub fn set_report_window(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        start_timestamp: u64,
-        end_timestamp: u64,
-    ) -> Result<(), RevoraError> {
-        Self::require_not_frozen(&env)?;
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        if current_issuer != issuer {
-            return Err(RevoraError::OfferingNotFound);
-        }
-        issuer.require_auth();
-        let window = AccessWindow { start_timestamp, end_timestamp };
-        Self::validate_window(&window)?;
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-        env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
-        env.events().publish(
-            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
-            (start_timestamp, end_timestamp),
-        );
-        Ok(())
-    }
-
     // â”€â”€ Meta-authorization, claims, windows, and query methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Register an ed25519 public key for a signer address.
@@ -8688,18 +8834,6 @@ impl RevoraRevenueShare {
         signer.require_auth();
         env.storage().persistent().set(&MetaDataKey::SignerKey(signer.clone()), &public_key);
         Self::emit_v2_event(&env, (EVENT_META_SIGNER_SET, signer), public_key);
-        let window = AccessWindow { start_timestamp, end_timestamp };
-        Self::validate_window(&window)?;
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-        env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
-        env.events().publish(
-            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
-            (start_timestamp, end_timestamp),
-        );
         Ok(())
     }
 
@@ -8821,7 +8955,7 @@ impl RevoraRevenueShare {
         ) {
             return Err(RevoraError::HolderBlacklisted);
         }
-        Self::require_not_frozen(&env, &offering_id, &holder)?;
+        Self::require_holder_not_frozen(&env, &offering_id, &holder)?;
 
         let share_bps = Self::get_holder_share(
             env.clone(),
@@ -13021,7 +13155,7 @@ impl RevoraRevenueShare {
 
         if cursor.last_key > 0 && !dry_run {
             env.events()
-                .publish((symbol_short!("mig_resume"), from_version, to_version), cursor.last_key);
+                .publish((symbol_short!("mig_rsume"), from_version, to_version), cursor.last_key);
         }
 
         // Add per-version migrators in a dispatch table
@@ -13073,6 +13207,7 @@ impl RevoraRevenueShare {
         }
         Ok(())
     }
+} // end impl RevoraRevenueShare (migration)
 
 // ── Contract self-test entrypoint (#618) ─────────────────────────────────────
 #[contractimpl]
@@ -13096,7 +13231,6 @@ impl RevoraRevenueShare {
         let _ = env; // Unused but required for Soroban contractimpl ABI
         crate::self_test::self_test_status()
     }
-}
 }
 
 #[cfg(test)]
