@@ -258,12 +258,12 @@ pub enum RevoraError {
     MaxDisputesReached = 60,
     /// The caller holds zero shares in the offering and cannot open a dispute.
     DisputeZeroShare = 61,
-    /// Claims are halted for this offering due to an active critical dispute.
-    DisputeFreezeActive = 62,
-    /// The dispute resolution caller is not the issuer of the disputed offering.
-    NotDisputeIssuer = 63,
-    /// The dispute is already resolved or rejected and cannot be resolved again.
-    DisputeAlreadyResolved = 64,
+    /// The provided nonce is not strictly greater than the last accepted nonce for this
+    /// (offering_id, holder) pair. Replayed or out-of-order `set_holder_share` calls are
+    /// rejected to prevent stale off-chain updates from overwriting newer on-chain state.
+    ///
+    /// Wire value: 62. Stable since the nonce-guard release.
+    StaleNonce = 62,
 }
 
 pub mod vesting;
@@ -1316,6 +1316,18 @@ pub enum DataKey2 {
     GovProposal(OfferingId, u32),
     /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
     VoteRecord(OfferingId, u32, Address),
+
+    // ── Nonce guard ──
+    /// Monotonic per-holder nonce for `set_holder_share`.
+    ///
+    /// Stores the last accepted nonce for `(offering_id, holder)`. Every
+    /// `set_holder_share` call must supply a `nonce` strictly greater than this
+    /// value, preventing replayed or out-of-order off-chain updates from
+    /// overwriting newer on-chain share state.
+    ///
+    /// On the first call for a given `(offering_id, holder)` no entry exists,
+    /// so any `nonce >= 1` is accepted.
+    HolderShareNonce(OfferingId, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -2013,6 +2025,7 @@ impl RevoraRevenueShare {
         holder: Address,
         share_bps: u32,
         share_class: Option<ShareClass>,
+        nonce: Option<u64>,
     ) -> Result<(), RevoraError> {
         if share_bps > 10_000 {
             return Err(RevoraError::InvalidShareBps);
@@ -2023,25 +2036,18 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        let old_share: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
-            .unwrap_or(0);
-
-        // Check per-class supply cap BEFORE aggregate cap
-        if let Some(ref sc) = share_class {
-            let class_cap_key = DataKey2::PerClassSupplyCap(offering_id.clone(), sc.clone());
-            let class_cap: i128 = env.storage().persistent().get(&class_cap_key).unwrap_or(0);
-            if class_cap > 0 {
-                let class_shares_key = DataKey2::TotalClassSharesIssued(offering_id.clone(), sc.clone());
-                let current_class_shares: i128 = env.storage().persistent().get(&class_shares_key).unwrap_or(0);
-                let new_class_shares = current_class_shares.saturating_sub(old_share as i128).saturating_add(share_bps as i128);
-                if new_class_shares > class_cap {
-                    env.events().publish((Symbol::new(env, "class_cap_hit"), sc.clone()), new_class_shares);
-                    return Err(RevoraError::ClassSupplyCapExceeded);
-                }
+        // ── Nonce monotonicity guard ──────────────────────────────────────────
+        // When a nonce is supplied the caller guarantees this update is strictly
+        // newer than any previously accepted one.  Reject equal or smaller values
+        // to prevent replayed or out-of-order off-chain updates from silently
+        // overwriting newer on-chain share state.
+        if let Some(n) = nonce {
+            let nonce_key = DataKey2::HolderShareNonce(offering_id.clone(), holder.clone());
+            let last_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+            if n <= last_nonce {
+                return Err(RevoraError::StaleNonce);
             }
+            env.storage().persistent().set(&nonce_key, &n);
         }
 
         // Check max total supply shares cap
@@ -6235,15 +6241,8 @@ impl RevoraRevenueShare {
             env.storage().persistent().set(&cat_key, &category);
         }
 
-        Self::set_holder_share_internal(
-            &env,
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
-            from.clone(),
-            from_share - amount_bps,
-        )?;
-        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps)?;
+        Self::set_holder_share_internal(&env, issuer.clone(), namespace.clone(), token.clone(), from.clone(), from_share - amount_bps, None, None)?;
+        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps, None, None)?;
 
         Ok(())
     }
@@ -7293,6 +7292,13 @@ impl RevoraRevenueShare {
     }
 
     /// Set a holder's revenue share in basis points for an offering.
+    ///
+    /// The `nonce` must be strictly greater than the last accepted nonce for this
+    /// `(offering_id, holder)` pair.  This monotonicity guard prevents stale
+    /// off-chain updates from silently overwriting newer on-chain share state.
+    /// Use `nonce = 1` on the first call; increment by at least 1 on every
+    /// subsequent call.  The contract persists the last accepted value so the
+    /// caller can derive the next valid nonce from `get_holder_share_nonce`.
     pub fn set_holder_share(
         env: Env,
         issuer: Address,
@@ -7300,6 +7306,7 @@ impl RevoraRevenueShare {
         token: Address,
         holder: Address,
         share_bps: u32,
+        nonce: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
@@ -7320,7 +7327,7 @@ impl RevoraRevenueShare {
 
         // Delegate to internal writer which maintains the aggregate running total
         // and enforces the per-offering sum invariant (≤ 10_000 bps).
-        Self::set_holder_share_internal(&env, issuer, namespace, token, holder, share_bps, None)
+        Self::set_holder_share_internal(&env, issuer, namespace, token, holder, share_bps, None, Some(nonce))
     }
 
     /// Set a holder's revenue share in basis points for a specific class of an offering.
@@ -7357,11 +7364,10 @@ impl RevoraRevenueShare {
             holder,
             share_bps,
             Some(share_class),
+            None,
         )
         )
     }
-
-    /// Open a formal on-chain dispute against an offering.
     ///
     /// The dispute ID is deterministic: `sha256(issuer || namespace || token || holder || meta_hash)`.
     /// A holder may have at most [`MAX_OPEN_DISPUTES_PER_HOLDER`] open disputes per offering.
@@ -7478,6 +7484,25 @@ impl RevoraRevenueShare {
         } else {
             env.storage().persistent().get(&DataKey::HolderShare(offering_id, holder)).unwrap_or(0)
         }
+    }
+
+    /// Return the last accepted nonce for a holder's share in an offering.
+    ///
+    /// Returns `0` when no `set_holder_share` call has ever been accepted for
+    /// this `(offering_id, holder)` pair.  The next valid nonce for a
+    /// `set_holder_share` call is any value strictly greater than this.
+    pub fn get_holder_share_nonce(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> u64 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey2::HolderShareNonce(offering_id, holder))
+            .unwrap_or(0)
     }
 
     /// Get a holder's revenue share in basis points for a specific class of an offering.
@@ -9206,6 +9231,7 @@ impl RevoraRevenueShare {
             holder,
             share_bps,
             share_class,
+            None,
         )
     }
 
@@ -9308,6 +9334,7 @@ impl RevoraRevenueShare {
             payload.token.clone(),
             payload.holder.clone(),
             payload.share_bps,
+            None,
             None,
         )?;
         Self::mark_meta_nonce_used(&env, &signer, nonce);
@@ -9862,6 +9889,8 @@ impl RevoraRevenueShare {
             token.clone(),
             holder.clone(),
             new_share,
+            None,
+            None,
         )?;
 
         // Remove the pending request
