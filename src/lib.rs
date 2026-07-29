@@ -223,8 +223,6 @@ pub enum RevoraError {
     BlacklistSizeLimitExceeded = 45,
     /// Approver has already approved this proposal.
     AlreadyApproved = 46,
-    /// The requester is still within the faucet cooldown window.
-    FaucetCooldownActive = 65,
     /// Total supply shares would exceed the offering's max total supply shares.
     MaxTotalSupplySharesExceeded = 67,
 
@@ -393,30 +391,6 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     pub executed: bool,
     pub expiry: u64,
-    /// Minimum quorum required in basis points (e.g. 5100 = 51%).
-    /// The sum of `voter_weight_bps` of all approvals must meet or exceed this.
-    pub quorum_bps: u32,
-}
-
-/// Per-offering governance proposal entry, pinned to a snapshot for tamper-resistant vote weighting.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct GovProposalEntry {
-    /// Monotonically increasing proposal id within the offering.
-    pub id: u32,
-    /// Human-readable description (max 9 chars, Soroban Symbol limit).
-    pub description: Symbol,
-    /// Snapshot reference pinned at proposal creation. All vote weights are
-    /// resolved from `SnapshotHolderShare(offering_id, snapshot_id, voter)`.
-    pub snapshot_id: u64,
-    /// Ledger timestamp at proposal creation.
-    pub created_at: u64,
-    /// Accumulated yes-vote weight in basis points.
-    pub yes_weight: u32,
-    /// Accumulated no-vote weight in basis points.
-    pub no_weight: u32,
-    /// Whether the proposal is still accepting votes.
-    pub open: bool,
 }
 
 /// Vote choice for governance ballots. Binary for now; extended values (Abstain, …)
@@ -501,6 +475,7 @@ const EVENT_META_SIGNER_SET: Symbol = symbol_short!("meta_key");
 const EVENT_META_DELEGATE_SET: Symbol = symbol_short!("meta_del");
 const EVENT_META_SHARE_SET: Symbol = symbol_short!("meta_shr");
 const EVENT_MULTISIG_INIT: Symbol = symbol_short!("ms_init");
+const EVENT_STALE_PROPOSAL_REJECT: Symbol = symbol_short!("stale_pr");
 const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 /// Emitted when `repair_audit_summary` writes a corrected `AuditSummary` to storage.
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
@@ -1245,12 +1220,6 @@ pub enum DataKey2 {
     HolderShareSchedule(OfferingId, Address),
     /// Packed flags: (event_versioning_enabled: bool, event_only_mode: bool).
     ContractFlags,
-
-    /// When `true`, V2-shaped indexed events are also emitted alongside V3 events,
-    /// providing a downgrade path for indexers that have not yet migrated to V3.
-    /// Defaults to `true` during the deprecation window.
-    /// Set by admin via `set_emit_v2_compat`.
-    EmitV2Compat,
 
     /// Direct offering index: (issuer, namespace, token) -> Offering for O(1) get_offering (#360).
     OfferingRecord(OfferingId),
@@ -10842,15 +10811,6 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&DataKey2::MultisigOwners, &owners.clone());
         env.storage().persistent().set(&DataKey2::MultisigProposalCount, &0_u32);
         env.storage().persistent().set(&DataKey2::MultisigProposalDuration, &proposal_duration);
-        env.storage().persistent().set(&DataKey2::MultisigQuorumBps, &quorum_bps);
-
-        // Store equal voting weight for each owner
-        let weight_per_owner = 10_000u32 / owners.len();
-        for i in 0..owners.len() {
-            let owner = owners.get(i).unwrap();
-            env.storage().persistent().set(&DataKey2::VoterWeight(owner), &weight_per_owner);
-        }
-
         env.events().publish((EVENT_MULTISIG_INIT, caller.clone()), (owners.len(), threshold));
         Ok(())
     }
@@ -10943,6 +10903,11 @@ impl RevoraRevenueShare {
             .persistent()
             .get(&DataKey2::MultisigProposalDuration)
             .ok_or(RevoraError::NotInitialized)?;
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::MultisigEpoch)
+            .unwrap_or(0);
         let now = env.ledger().timestamp();
         let expiry = now.checked_add(duration).ok_or(RevoraError::InvalidAmount)?;
 
@@ -10960,7 +10925,6 @@ impl RevoraRevenueShare {
             approvals: initial_approvals,
             executed: false,
             expiry,
-            quorum_bps,
         };
 
         env.storage().persistent().set(&DataKey2::MultisigProposal(id), &proposal);
@@ -11033,6 +10997,19 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ProposalExpired);
         }
 
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::MultisigEpoch)
+            .unwrap_or(0);
+        if proposal.epoch != current_epoch {
+            env.events().publish(
+                (EVENT_STALE_PROPOSAL_REJECT, executor.clone()),
+                (proposal_id, proposal.epoch, current_epoch),
+            );
+            return Err(RevoraError::StaleProposal);
+        }
+
         let threshold: u32 = env
             .storage()
             .persistent()
@@ -11065,6 +11042,8 @@ impl RevoraRevenueShare {
                     return Err(RevoraError::InvalidShareBps);
                 }
                 env.storage().persistent().set(&DataKey2::MultisigThreshold, &new_threshold);
+                let next_epoch = current_epoch + 1;
+                env.storage().persistent().set(&DataKey2::MultisigEpoch, &next_epoch);
             }
             ProposalAction::AddOwner(new_owner) => {
                 let mut owners: Vec<Address> =
@@ -11077,6 +11056,8 @@ impl RevoraRevenueShare {
                 }
                 owners.push_back(new_owner);
                 env.storage().persistent().set(&DataKey2::MultisigOwners, &owners);
+                let next_epoch = current_epoch + 1;
+                env.storage().persistent().set(&DataKey2::MultisigEpoch, &next_epoch);
             }
             ProposalAction::RemoveOwner(old_owner) => {
                 let owners: Vec<Address> =
@@ -11097,6 +11078,8 @@ impl RevoraRevenueShare {
                     }
                 }
                 env.storage().persistent().set(&DataKey2::MultisigOwners, &new_owners);
+                let next_epoch = current_epoch + 1;
+                env.storage().persistent().set(&DataKey2::MultisigEpoch, &next_epoch);
             }
             ProposalAction::SetProposalDuration(new_duration) => {
                 if new_duration == 0 {
