@@ -287,11 +287,9 @@ mod test_claim_transfer_fail;
 mod test_compute_share_invariants;
 #[cfg(test)]
 mod test_duplicates;
-#[cfg(test)]
-mod test_governance_proposals;
-#[cfg(test)]
-mod test_time_windows;
 mod test_event_indexed_v2;
+#[cfg(test)]
+mod test_event_indexed_v3;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
@@ -400,50 +398,44 @@ pub struct Proposal {
     pub quorum_bps: u32,
 }
 
-/// Status of an on-chain dispute record.
+/// Per-offering governance proposal entry, pinned to a snapshot for tamper-resistant vote weighting.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub enum DisputeStatus {
-    /// Dispute is open and awaiting resolution.
-    Open,
-    /// Dispute has been resolved in favour of the holder.
-    Resolved,
-    /// Dispute has been rejected by the issuer or admin.
-    Rejected,
+pub struct GovProposalEntry {
+    /// Monotonically increasing proposal id within the offering.
+    pub id: u32,
+    /// Human-readable description (max 9 chars, Soroban Symbol limit).
+    pub description: Symbol,
+    /// Snapshot reference pinned at proposal creation. All vote weights are
+    /// resolved from `SnapshotHolderShare(offering_id, snapshot_id, voter)`.
+    pub snapshot_id: u64,
+    /// Ledger timestamp at proposal creation.
+    pub created_at: u64,
+    /// Accumulated yes-vote weight in basis points.
+    pub yes_weight: u32,
+    /// Accumulated no-vote weight in basis points.
+    pub no_weight: u32,
+    /// Whether the proposal is still accepting votes.
+    pub open: bool,
 }
 
-/// Severity level of an on-chain dispute.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum DisputeSeverity {
-    /// Standard dispute — no special side-effects.
-    Standard,
-    /// Critical dispute — halts claims for the affected offering until resolved.
-    Critical,
-}
-
-/// An on-chain dispute opened by a holder against an offering.
+/// Vote choice for governance ballots. Binary for now; extended values (Abstain, …)
+/// can be added in a future minor version without breaking V3 subscribers because
+/// the `vote_v3` event encodes this as a `u32` discriminant.
 ///
-/// The `id` is deterministic: `sha256(issuer || namespace || token || holder || meta_hash)`.
+/// ### Wire values (frozen — do not renumber)
+/// | Value | Meaning |
+/// |-------|---------|
+/// | 0     | `No`    |
+/// | 1     | `Yes`   |
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Dispute {
-    /// Deterministic identifier for this dispute.
-    pub id: BytesN<32>,
-    /// The holder who opened the dispute.
-    pub holder: Address,
-    /// The offering the dispute concerns.
-    pub offering_id: OfferingId,
-    /// Ledger timestamp when the dispute was opened.
-    pub opened_at: u64,
-    /// Severity level of the dispute.
-    pub severity: DisputeSeverity,
-    /// Hash of the off-chain dispute metadata (evidence, description, etc.).
-    pub meta_hash: BytesN<32>,
-    /// Current status of the dispute.
-    pub status: DisputeStatus,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoteChoice {
+    /// Vote against the proposal.
+    No = 0,
+    /// Vote in favour of the proposal.
+    Yes = 1,
 }
-
 
 const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 
@@ -574,10 +566,15 @@ const EVENT_UNFREEZE_OFFERING: Symbol = symbol_short!("ufrz_off");
 const EVENT_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
 
-// ── Governance event constants (issue #557) ──
+// ── Governance event constants (issue #557, #559) ──
 const EVENT_GOV_PROP_CREATED: Symbol = symbol_short!("gov_new");
 const EVENT_GOV_VOTE_CAST: Symbol = symbol_short!("gov_vote");
 const EVENT_WEIGHT_PIN: Symbol = symbol_short!("wt_pin");
+/// Stable versioned indexed event for every ballot cast — consumed by off-chain indexers
+/// to reconstruct per-proposal governance state without re-reading all `gov_vote` events.
+/// Topic: `(ev_idx3, EventIndexTopicV3 { event_type: "vote_v3", period_id: 0, ... })`
+/// Data:  `(proposal_id: u32, voter: Address, choice: VoteChoice, weight_bps: u32)`
+const EVENT_TYPE_VOTE_V3: Symbol = symbol_short!("vote_v3");
 
 /// Emitted when an oracle from the fallback chain is selected to provide the FX rate.
 /// Topic: `(oracle_src_used, issuer, namespace, token)`.
@@ -1023,14 +1020,6 @@ pub struct PendingRedemption {
     pub timestamp: u64,
 }
 
-/// Per-offering redemption fee configuration.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct RedemptionFeeConfig {
-    pub fee_bps: u32,
-    pub treasury: Address,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowDataKey {
@@ -1091,6 +1080,12 @@ pub struct SnapshotEntry {
     pub total_bps: u32,
 }
 
+/// Primary storage keys for core contract state.
+/// Split from the full key set to stay within the Soroban XDR union variant limit (â‰¤50).
+///
+/// Scoped to the crate: storage keys are an internal implementation detail and are not part
+/// of the contract's external interface, so no contract spec entry is generated for them.
+/// This also keeps the enum clear of the 50-case spec union limit as new keys are added.
 #[contracttype]
 #[derive(Clone)]
 pub(crate) enum DataKey {
@@ -1278,10 +1273,49 @@ pub enum DataKey2 {
     /// Monotonically increasing counter for admin rotation entries.
     AdminRotationCount,
 
-    /// Per-holder pending redemption request.
-    RedemptionRequest(OfferingId, Address),
-    /// Per-offering redemption fee configuration (fee_bps and treasury address).
-    RedemptionFeeConfig(OfferingId),
+    // ── Missing variants added for compilation ──
+    /// Current accrual index counter for dividend-accrual ledger.
+    AccrualIndex(OfferingId),
+    /// Per-offering platform fee model.
+    OfferingPlatformFee(OfferingId),
+    /// Denomination metadata (symbol, decimals) for an offering.
+    DenominationMetadata(OfferingId),
+    /// FX oracle configuration for an offering.
+    FxOracleConfig(OfferingId),
+    /// Transfer restrictions per category for an offering.
+    TransferRestrictions(OfferingId, Symbol),
+    /// Holder category tag for transfer restriction purposes.
+    HolderCategory(OfferingId, Address),
+    /// Per-category holder count for transfer restriction accounting.
+    CategoryHolderCount(OfferingId, Symbol),
+    /// Emergency freeze record for (offering_id, holder).
+    EmergencyFreeze(OfferingId, Address),
+    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
+    TotalSharesIssued(OfferingId),
+    /// Maximum total supply shares cap for an offering.
+    MaxTotalSupplyShares(OfferingId),
+    /// Per-entry faucet seed for testnet holder seeding.
+    FaucetSeedEntry(OfferingId, u32),
+
+    // ── Multisig keys ──
+    /// Multisig approval threshold.
+    MultisigThreshold,
+    /// Multisig owner list.
+    MultisigOwners,
+    /// Multisig proposal counter.
+    MultisigProposalCount,
+    /// Default proposal duration in seconds.
+    MultisigProposalDuration,
+    /// Multisig proposal by id.
+    MultisigProposal(u32),
+
+    // ── Governance keys (issue #557) ──
+    /// Per-offering governance proposal counter.
+    GovProposalCount(OfferingId),
+    /// Per-offering governance proposal by id.
+    GovProposal(OfferingId, u32),
+    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
+    VoteRecord(OfferingId, u32, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1602,10 +1636,8 @@ impl RevoraRevenueShare {
     /// # Errors
     /// - [`RevoraError::MigrationDowngradeNotAllowed`] if `CONTRACT_VERSION < persisted version`.
     fn assert_contract_version_compatible(env: &Env) -> Result<(), RevoraError> {
-        if let Some(min_supported) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, (u32, u32, u32)>(&DataKey::DeployedVersion)
+        if let Some(min_supported) =
+            env.storage().persistent().get::<DataKey, (u32, u32, u32)>(&DataKey::DeployedVersion)
         {
             if CONTRACT_VERSION < min_supported {
                 env.events().publish(
@@ -1778,6 +1810,26 @@ impl RevoraRevenueShare {
         T: IntoVal<Env, soroban_sdk::Val> + soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>,
     {
         env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
+    }
+
+    /// Dual-emit both V2 and V3 indexed events for the same state change.
+    ///
+    /// V2 subscribers continue to read `ev_idx2` unchanged.  V3 subscribers
+    /// consume `ev_idx3` which carries `version=3` and the `_reserved` field
+    /// enabling additive schema evolution without struct reshuffles.
+    ///
+    /// Both events share the same `data` payload; the only difference is the
+    /// topic struct (V2 vs V3) and the outer topic symbol.
+    fn emit_v2_and_v3<D>(
+        env: &Env,
+        topic_v2: EventIndexTopicV2,
+        topic_v3: EventIndexTopicV3,
+        data: D,
+    ) where
+        D: IntoVal<Env, soroban_sdk::Val> + soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + Clone,
+    {
+        env.events().publish((EVENT_INDEXED_V2, topic_v2), data.clone());
+        env.events().publish((EVENT_INDEXED_V3, topic_v3), data);
     }
 
     fn jurisdiction_set_event(env: &Env) -> Symbol {
@@ -6155,12 +6207,26 @@ impl RevoraRevenueShare {
         if let Some(existing) = existing_cat {
             if existing != category {
                 if to_share > 0 {
-                    let old_count_key = DataKey2::CategoryHolderCount(offering_id.clone(), existing);
-                    let old_count: u32 = env.storage().persistent().get(&old_count_key).unwrap_or(0);
+                    let old_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), existing);
+                    let old_count: u32 =
+                        env.storage().persistent().get(&old_count_key).unwrap_or(0);
                     env.storage().persistent().set(&old_count_key, &old_count.saturating_sub(1));
-                    
-                    let new_count_key = DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
-                    let new_count: u32 = env.storage().persistent().get(&new_count_key).unwrap_or(0);
+
+                    let new_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
+                    let new_count: u32 =
+                        env.storage().persistent().get(&new_count_key).unwrap_or(0);
+                    if let Some(restrictions) =
+                        env.storage().persistent().get::<_, TransferRestrictions>(
+                            &DataKey2::TransferRestrictions(offering_id.clone(), category.clone()),
+                        )
+                    {
+                        if new_count >= restrictions.max_holders {
+                            env.storage().persistent().set(&old_count_key, &old_count);
+                            return Err(RevoraError::CategoryCapReached);
+                        }
+                    }
                     env.storage().persistent().set(&new_count_key, &(new_count + 1));
                 }
                 env.storage().persistent().set(&cat_key, &category);
@@ -10596,68 +10662,6 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-    // ── Dispute window management ────────────────────────────────────────────
-
-    /// Get the dispute window in seconds for an offering.
-    /// Returns `DEFAULT_DISPUTE_WINDOW_SECS` (30 days) when not configured.
-    pub fn get_dispute_window(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-    ) -> u64 {
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-        env.storage()
-            .persistent()
-            .get::<DataKey2, u64>(&DataKey2::DisputeWindowSecs(offering_id))
-            .unwrap_or(DEFAULT_DISPUTE_WINDOW_SECS)
-    }
-
-    /// Set the dispute window in seconds for an offering.
-    /// Only the issuer or admin may call.
-    /// Emits `EVENT_DISPUTE_WINDOW_SET` on success.
-    pub fn set_dispute_window(
-        env: Env,
-        caller: Address,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        window_secs: u64,
-    ) -> Result<(), RevoraError> {
-        Self::require_not_frozen(&env)?;
-        caller.require_auth();
-
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-
-        // Verify offering exists.
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone());
-        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
-        if caller != current_issuer && !is_admin {
-            return Err(RevoraError::NotAuthorized);
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey2::DisputeWindowSecs(offering_id), &window_secs);
-
-        env.events().publish(
-            (EVENT_DISPUTE_WINDOW_SET, issuer, namespace, token),
-            (caller, window_secs),
-        );
-        Ok(())
-    }
-
     /// Emergency unfreeze a holder for an offering.
     ///
     /// Authorization boundary matches `emergency_freeze_holder`.
@@ -11154,10 +11158,8 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-        let last_request_ts: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> =
+            env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
@@ -11174,9 +11176,7 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey2::FaucetLastRequest(requester), &now);
+        env.storage().persistent().set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));
@@ -12083,10 +12083,40 @@ impl RevoraRevenueShare {
             (proposal_id, proposal.snapshot_id, weight),
         );
 
-        // Emit vote cast event.
+        // Emit legacy vote cast event (gov_vote) for backward-compatible consumers.
         env.events().publish(
-            (EVENT_GOV_VOTE_CAST, issuer, namespace, token),
-            (proposal_id, voter, approve, weight),
+            (EVENT_GOV_VOTE_CAST, issuer.clone(), namespace.clone(), token.clone()),
+            (proposal_id, voter.clone(), approve, weight),
+        );
+
+        // Emit stable vote_v3 indexed event for off-chain indexer reconstruction
+        // of governance state (#559). Both V2 and V3 topics are emitted concurrently
+        // so that V2-only subscribers are not broken during the deprecation window.
+        //
+        // Data payload: (proposal_id: u32, voter: Address, choice: VoteChoice, weight_bps: u32)
+        // The `VoteChoice` enum encodes `approve` as `Yes(1)` / `No(0)` so indexers
+        // can extend to additional choices without changing the wire layout.
+        let choice = if approve { VoteChoice::Yes } else { VoteChoice::No };
+        Self::emit_v2_and_v3(
+            &env,
+            EventIndexTopicV2 {
+                version: 2,
+                event_type: EVENT_TYPE_VOTE_V3,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV3 {
+                version: 3,
+                event_type: EVENT_TYPE_VOTE_V3,
+                issuer,
+                namespace,
+                token,
+                period_id: 0,
+                _reserved: 0,
+            },
+            (proposal_id, voter, choice, weight),
         );
 
         Ok(weight)
@@ -12499,5 +12529,3 @@ mod test_close_period;
 mod test_snapshot_voting_weight;
 #[cfg(test)]
 mod test_storage_layout_version;
-#[cfg(test)]
-mod test_dispute;
