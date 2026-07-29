@@ -201,6 +201,13 @@ pub enum RevoraError {
     AlreadyAtTargetVersion = 32,
     /// Target version is lower than the current deployed version.
     MigrationDowngradeNotAllowed = 33,
+
+    /// Close-period abort due to a detected accrual or share ledger invariant violation.
+    ///
+    /// This error is returned before the period is sealed to prevent partially committed
+    /// close actions when the underlying state is inconsistent.
+    CloseAbortInvariantsViolated = 34,
+
     /// Admin rotation failed: new admin cannot be the same as current.
     AdminRotationSameAddress = 40,
     /// Admin rotation failed: another rotation is already pending.
@@ -223,6 +230,8 @@ pub enum RevoraError {
     BlacklistSizeLimitExceeded = 45,
     /// Approver has already approved this proposal.
     AlreadyApproved = 46,
+    /// The requester is still within the faucet cooldown window.
+    FaucetCooldownActive = 56,
     /// Total supply shares would exceed the offering's max total supply shares.
     MaxTotalSupplySharesExceeded = 67,
 
@@ -446,6 +455,8 @@ const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
+const EVENT_ROYALTY_CONFIG: Symbol = symbol_short!("roy_cfg");
+const EVENT_ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
@@ -1155,6 +1166,8 @@ pub(crate) enum DataKey {
     PlatformFeeBps,
     /// Per-offering per-asset fee override (#98).
     OfferingFeeBps(OfferingId, Address),
+    /// Per-offering per-asset secondary-market royalty override (#562).
+    OfferingRoyaltyBps(OfferingId, Address),
     /// Platform level per-asset fee (#98).
     PlatformFeePerAsset(Address),
     /// Whether snapshot finalization is enforced globally.
@@ -1259,70 +1272,16 @@ pub enum DataKey2 {
     /// Off-chain disclosure metadata (URI + hash) for an offering (#485).
     DisclosureMeta(OfferingId),
 
+    /// Per-offering minimum revenue threshold below which reports are skipped.
+    MinRevenueThreshold(OfferingId),
+    /// Per-offering cumulative deposited revenue tracker.
+    DepositedRevenue(OfferingId),
     /// Timestamp of the last faucet request for a requester address.
     FaucetLastRequest(Address),
-    /// Whether dual-signature close-of-period is enabled for this offering.
-    DualSigEnabled(OfferingId),
-    /// Append-only admin rotation log entry keyed by rotation_id (sequential counter).
-    AdminRotationLog(u64),
-    /// Monotonically increasing counter for admin rotation entries.
-    AdminRotationCount,
-
-    // ── Missing variants added for compilation ──
-    /// Current accrual index counter for dividend-accrual ledger.
-    AccrualIndex(OfferingId),
-    /// Per-offering platform fee model.
-    OfferingPlatformFee(OfferingId),
-    /// Denomination metadata (symbol, decimals) for an offering.
-    DenominationMetadata(OfferingId),
-    /// FX oracle configuration for an offering.
-    FxOracleConfig(OfferingId),
-    /// Transfer restrictions per category for an offering.
-    TransferRestrictions(OfferingId, Symbol),
-    /// Holder category tag for transfer restriction purposes.
-    HolderCategory(OfferingId, Address),
-    /// Per-category holder count for transfer restriction accounting.
-    CategoryHolderCount(OfferingId, Symbol),
-    /// Emergency freeze record for (offering_id, holder).
-    EmergencyFreeze(OfferingId, Address),
-    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
-    TotalSharesIssued(OfferingId),
-    /// Maximum total supply shares cap for an offering.
-    MaxTotalSupplyShares(OfferingId),
-    /// Per-entry faucet seed for testnet holder seeding.
-    FaucetSeedEntry(OfferingId, u32),
-
-    // ── Multisig keys ──
-    /// Multisig approval threshold.
-    MultisigThreshold,
-    /// Multisig owner list.
-    MultisigOwners,
-    /// Multisig proposal counter.
-    MultisigProposalCount,
-    /// Default proposal duration in seconds.
-    MultisigProposalDuration,
-    /// Multisig proposal by id.
-    MultisigProposal(u32),
-
-    // ── Governance keys (issue #557) ──
-    /// Per-offering governance proposal counter.
-    GovProposalCount(OfferingId),
-    /// Per-offering governance proposal by id.
-    GovProposal(OfferingId, u32),
-    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
-    VoteRecord(OfferingId, u32, Address),
-
-    // ── Nonce guard ──
-    /// Monotonic per-holder nonce for `set_holder_share`.
-    ///
-    /// Stores the last accepted nonce for `(offering_id, holder)`. Every
-    /// `set_holder_share` call must supply a `nonce` strictly greater than this
-    /// value, preventing replayed or out-of-order off-chain updates from
-    /// overwriting newer on-chain share state.
-    ///
-    /// On the first call for a given `(offering_id, holder)` no entry exists,
-    /// so any `nonce >= 1` is accepted.
-    HolderShareNonce(OfferingId, Address),
+    /// Per-offering investment constraints (min/max stake).
+    InvestmentConstraints(OfferingId),
+    /// Per-offering supply cap (0 = uncapped).
+    SupplyCap(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1811,6 +1770,20 @@ impl RevoraRevenueShare {
         }
         // 3. Global platform fee
         env.storage().persistent().get::<DataKey, u32>(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    fn get_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OfferingRoyaltyBps(offering_id, asset))
+            .unwrap_or(0)
     }
 
     /// Helper to emit deterministic v2 versioned events for core event versioning.
@@ -2907,6 +2880,120 @@ impl RevoraRevenueShare {
     ) -> u32 {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&DataKey::OfferingFeeBps(offering_id, asset)).unwrap_or(0)
+    }
+
+    /// Set a per-offering per-asset secondary-market royalty in basis points. Issuer-only. (#562)
+    ///
+    /// Emits `EVENT_ROYALTY_CONFIG` with `(issuer, namespace, token, asset, royalty_bps)`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist or caller is not the issuer.
+    /// - `InvalidRevenueShareBps` — `royalty_bps` exceeds `MAX_PLATFORM_FEE_BPS` (5 000).
+    pub fn set_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+        royalty_bps: u32,
+    ) -> Result<(), RevoraError> {
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if royalty_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::InvalidRevenueShareBps);
+        }
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::OfferingRoyaltyBps(offering_id, asset.clone()), &royalty_bps);
+        env.events().publish((EVENT_ROYALTY_CONFIG, issuer, namespace, token, asset), royalty_bps);
+        Ok(())
+    }
+
+    /// Return the per-offering per-asset secondary-market royalty in basis points.
+    /// 0 means no royalty is configured.
+    pub fn get_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey::OfferingRoyaltyBps(offering_id, asset))
+            .unwrap_or(0)
+    }
+
+    /// Pay a configured secondary-market royalty on a transfer.
+    ///
+    /// The royalty amount is routed to the issuer and is computed as
+    /// `amount * royalty_bps / BPS_DENOMINATOR`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist.
+    /// - `InvalidAmount` — transfer amount is not positive.
+    /// - `TransferFailed` — token transfer to issuer failed.
+    pub fn pay_secondary_market_royalty(
+        env: Env,
+        payer: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        payment_asset: Address,
+        amount: i128,
+        seller: Address,
+        buyer: Address,
+    ) -> Result<i128, RevoraError> {
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        payer.require_auth();
+
+        let royalty_bps = Self::get_secondary_market_royalty_bps(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            payment_asset.clone(),
+        );
+        let royalty_amount =
+            (amount * royalty_bps as i128).checked_div(BPS_DENOMINATOR).unwrap_or(0);
+
+        if royalty_amount > 0 {
+            if token::Client::new(&env, &payment_asset)
+                .try_transfer(&payer, &current_issuer, &royalty_amount)
+                .is_err()
+            {
+                return Err(RevoraError::TransferFailed);
+            }
+        }
+
+        Self::emit_v2_event(
+            &env,
+            (EVENT_ROYALTY_PAID, issuer.clone(), namespace.clone(), token.clone()),
+            (payer.clone(), seller, buyer, payment_asset, amount, royalty_amount),
+        );
+        env.events().publish(
+            (EVENT_ROYALTY_PAID, issuer, namespace, token),
+            (payer, seller, buyer, payment_asset, amount, royalty_amount),
+        );
+
+        Ok(royalty_amount)
     }
 
     /// Set a platform-level per-asset fee in basis points. Admin-only. (#98)
@@ -8933,6 +9020,8 @@ impl RevoraRevenueShare {
             return Err(RevoraError::PeriodAlreadyClosed);
         }
 
+        Self::assert_close_period_invariants(&env, &offering_id)?;
+
         let closed_at = env.ledger().timestamp();
         env.storage().persistent().set(&closed_key, &closed_at);
 
@@ -8949,6 +9038,32 @@ impl RevoraRevenueShare {
         // and the emitted pay order matches the on-chain sealed state.
         Self::record_and_emit_pay_order(&env, &offering_id, period_id);
 
+        Ok(())
+    }
+
+    fn assert_close_period_invariants(
+        env: &Env,
+        offering_id: &OfferingId,
+    ) -> Result<(), RevoraError> {
+        let total_share_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShareTotal(offering_id.clone()))
+            .unwrap_or(0);
+
+        let total_shares_issued: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TotalSharesIssued(offering_id.clone()))
+            .unwrap_or(0);
+
+        if total_share_bps > 10_000
+            || total_shares_issued < 0
+            || total_shares_issued > 10_000
+            || total_share_bps as i128 != total_shares_issued
+        {
+            return Err(RevoraError::CloseAbortInvariantsViolated);
+        }
         Ok(())
     }
 
@@ -11434,8 +11549,10 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-        let last_request_ts: Option<u64> =
-            env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
@@ -11452,7 +11569,9 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.storage().persistent().set(&DataKey2::FaucetLastRequest(requester), &now);
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));
