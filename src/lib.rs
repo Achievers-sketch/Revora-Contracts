@@ -190,6 +190,8 @@ pub enum RevoraError {
     SignatureReplay = 28,
     /// Off-chain signer key has not been registered.
     SignerKeyNotRegistered = 29,
+    /// The provided attestation network identifier does not match the active ledger network.
+    NetworkIdMismatch = 62,
     /// Multisig proposal has expired.
     /// Wire value: 30. Stable since v1.
     ProposalExpired = 30,
@@ -283,7 +285,7 @@ pub mod tax_bucket;
 /// security notes.
 pub mod merkle_helpers;
 
-#[cfg(feature = "kani")]
+#[cfg(any(feature = "kani", test))]
 pub mod kani_harness;
 
 #[cfg(test)]
@@ -400,24 +402,6 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     pub executed: bool,
     pub expiry: u64,
-}
-
-/// Vote choice for governance ballots. Binary for now; extended values (Abstain, …)
-/// can be added in a future minor version without breaking V3 subscribers because
-/// the `vote_v3` event encodes this as a `u32` discriminant.
-///
-/// ### Wire values (frozen — do not renumber)
-/// | Value | Meaning |
-/// |-------|---------|
-/// | 0     | `No`    |
-/// | 1     | `Yes`   |
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VoteChoice {
-    /// Vote against the proposal.
-    No = 0,
-    /// Vote in favour of the proposal.
-    Yes = 1,
 }
 
 const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
@@ -1278,10 +1262,54 @@ pub enum DataKey2 {
     DepositedRevenue(OfferingId),
     /// Timestamp of the last faucet request for a requester address.
     FaucetLastRequest(Address),
-    /// Per-offering investment constraints (min/max stake).
-    InvestmentConstraints(OfferingId),
-    /// Per-offering supply cap (0 = uncapped).
-    SupplyCap(OfferingId),
+    /// Whether dual-signature close-of-period is enabled for this offering.
+    DualSigEnabled(OfferingId),
+    /// Global freeze reason recorded during set_freeze (#605).
+    GlobalFreezeReason,
+
+    // ── Missing variants added for compilation ──
+    /// Current accrual index counter for dividend-accrual ledger.
+    AccrualIndex(OfferingId),
+    /// Per-offering platform fee model.
+    OfferingPlatformFee(OfferingId),
+    /// Denomination metadata (symbol, decimals) for an offering.
+    DenominationMetadata(OfferingId),
+    /// FX oracle configuration for an offering.
+    FxOracleConfig(OfferingId),
+    /// Transfer restrictions per category for an offering.
+    TransferRestrictions(OfferingId, Symbol),
+    /// Holder category tag for transfer restriction purposes.
+    HolderCategory(OfferingId, Address),
+    /// Per-category holder count for transfer restriction accounting.
+    CategoryHolderCount(OfferingId, Symbol),
+    /// Emergency freeze record for (offering_id, holder).
+    EmergencyFreeze(OfferingId, Address),
+    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
+    TotalSharesIssued(OfferingId),
+    /// Maximum total supply shares cap for an offering.
+    MaxTotalSupplyShares(OfferingId),
+    /// Per-entry faucet seed for testnet holder seeding.
+    FaucetSeedEntry(OfferingId, u32),
+
+    // ── Multisig keys ──
+    /// Multisig approval threshold.
+    MultisigThreshold,
+    /// Multisig owner list.
+    MultisigOwners,
+    /// Multisig proposal counter.
+    MultisigProposalCount,
+    /// Default proposal duration in seconds.
+    MultisigProposalDuration,
+    /// Multisig proposal by id.
+    MultisigProposal(u32),
+
+    // ── Governance keys (issue #557) ──
+    /// Per-offering governance proposal counter.
+    GovProposalCount(OfferingId),
+    /// Per-offering governance proposal by id.
+    GovProposal(OfferingId, u32),
+    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
+    VoteRecord(OfferingId, u32, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -2244,57 +2272,11 @@ impl RevoraRevenueShare {
             updated.push_back(checkpoint);
         }
 
-        updated.push_back(HolderShareCheckpoint { start_index: period_count, share_bps: new_share });
-
-        let threshold = Self::get_checkpoint_threshold(env, offering_id);
-        if threshold > 0 && updated.len() > threshold as usize {
-            let keep_count = threshold as usize;
-            let compress_count = updated.len() - keep_count;
-
-            let anchor_start_idx = updated.get(0).map(|c| c.start_index).unwrap_or(0);
-            let anchor_end_idx = if compress_count > 0 {
-                let last_compressed = compress_count - 1;
-                if last_compressed + 1 < updated.len() {
-                    updated.get(last_compressed + 1).map(|c| c.start_index).unwrap_or(period_count).saturating_sub(1)
-                } else {
-                    period_count.saturating_sub(1)
-                }
-            } else {
-                period_count.saturating_sub(1)
-            };
-
-            let last_claimed_idx: u32 = env
-                .storage()
-                .persistent()
-                .get::<_, u32>(&DataKey::LastClaimedIdx(offering_id.clone(), holder.clone()))
-                .unwrap_or(0);
-            let unclaimed_start = core::cmp::max(anchor_start_idx, last_claimed_idx);
-            let claimable_sum = if unclaimed_start <= anchor_end_idx {
-                Self::compute_anchor_claimable_sum(env, offering_id, holder, unclaimed_start, anchor_end_idx.saturating_add(1))
-            } else {
-                0
-            };
-
-            let anchor_key = DataKey2::AccrualAnchor(offering_id.clone(), holder.clone());
-            let existing_anchor: Option<AccrualAnchor> = env.storage().persistent().get(&anchor_key);
-            let consumed_end = existing_anchor.as_ref().map(|a| a.end_idx).unwrap_or(0);
-            let new_claimable_sum = claimable_sum.saturating_add(existing_anchor.map(|a| a.claimable_sum).unwrap_or(0));
-            env.storage().persistent().set(
-                &anchor_key,
-                &AccrualAnchor { end_idx: anchor_end_idx.max(consumed_end), claimable_sum: new_claimable_sum },
-            );
-
-            let pruned: Vec<HolderShareCheckpoint> = updated.into_iter().skip(compress_count).collect();
-            env.storage().persistent().set(
-                &DataKey2::HolderShareSchedule(offering_id.clone(), holder.clone()),
-                &pruned,
-            );
-        } else {
-            env.storage().persistent().set(
-                &DataKey2::HolderShareSchedule(offering_id.clone(), holder.clone()),
-                &updated,
-            );
-        }
+        updated
+            .push_back(HolderShareCheckpoint { start_index: period_count, share_bps: new_share });
+        env.storage()
+            .persistent()
+            .set(&DataKey2::HolderShareSchedule(offering_id.clone(), holder.clone()), &updated);
     }
 
     fn get_holder_accrual_state(
@@ -6299,25 +6281,18 @@ impl RevoraRevenueShare {
         to: Address,
         amount_bps: u32,
         category: Symbol,
-    ) -> (bool, u32) {
-        match Self::check_transfer_eligibility(&env, &issuer, &namespace, &token, &from, &to, amount_bps, &category) {
-            Ok(_) => (true, 0),
-            Err(e) => (false, e as u32),
-        }
-    }
-
-    fn check_transfer_eligibility(
-        env: &Env,
-        issuer: &Address,
-        namespace: &Symbol,
-        token: &Address,
-        from: &Address,
-        to: &Address,
-        amount_bps: u32,
-        category: &Symbol,
+        attest_hash: BytesN<32>,
+        network_id: BytesN<32>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(env)?;
         // We do not check issuer.require_auth() here because this is a pure query
+
+        let active_network_id = env.ledger().network_id();
+        if network_id != active_network_id {
+            return Err(RevoraError::NetworkIdMismatch);
+        }
+
+        let _ = attest_hash;
 
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -6463,8 +6438,15 @@ impl RevoraRevenueShare {
             env.storage().persistent().set(&cat_key, &category);
         }
 
-        Self::set_holder_share_internal(&env, issuer.clone(), namespace.clone(), token.clone(), from.clone(), from_share - amount_bps, None, None)?;
-        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps, None, None)?;
+        Self::set_holder_share_internal(
+            &env,
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            from.clone(),
+            from_share - amount_bps,
+        )?;
+        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps)?;
 
         Ok(())
     }
@@ -11549,10 +11531,8 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-        let last_request_ts: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> =
+            env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
@@ -11569,9 +11549,7 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey2::FaucetLastRequest(requester), &now);
+        env.storage().persistent().set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));
