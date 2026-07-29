@@ -51,7 +51,6 @@ extern crate std;
 
 extern crate alloc;
 
-use alloc::format;
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
 use alloc::format;
 use soroban_sdk::Env;
@@ -319,12 +318,9 @@ fn round_half_up_gte_truncation_for_positive_amounts() {
         for &bps in bps_values {
             let t = c.compute_share(&amount, &bps, &RoundingMode::Truncation);
             let r = c.compute_share(&amount, &bps, &RoundingMode::RoundHalfUp);
-            assert!(
-                r >= t,
-                "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}"
-            );
-            assert_bounds(t, amount, "Truncation");
-            assert_bounds(r, amount, "RoundHalfUp");
+            assert!(r >= t, "RoundHalfUp ({r}) < Truncation ({t}) for amount={amount}, bps={bps}");
+            assert_bounds(t, amount, &format!("Truncation amount={amount} bps={bps}"));
+            assert_bounds(r, amount, &format!("RoundHalfUp amount={amount} bps={bps}"));
         }
     }
 }
@@ -589,8 +585,8 @@ fn remainder_product_bound_holds_for_all_bps() {
         20_000,
         100_000,
         1_000_000,
-        i128::MAX / 10_000 * 10_000, // Near-max, divisible by 10_000
-        i128::MIN / 10_000 * 10_000, // Near-min, divisible by 10_000
+        (i128::MAX / 10_000 - 1) * 10_000 + 9_999, // Large positive with near-max remainder
+        (i128::MIN / 10_000 + 1) * 10_000 - 9_999, // Large negative with near-min remainder
     ];
 
     let bps_values = [1_u32, 100, 1_000, 5_000, 9_999, 10_000];
@@ -637,4 +633,52 @@ fn checked_mul_defense_in_depth_prevents_overflow() {
             assert_bounds(result, amount, "Extreme amount");
         }
     }
+}
+
+#[test]
+fn test_per_class_supply_cap_edge_cases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register_contract(None, crate::RevoraContract);
+    let client = crate::RevoraContractClient::new(&env, &contract_id);
+    
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    
+    let issuer = Address::generate(&env);
+    let namespace = Symbol::new(&env, "ns");
+    let token = Address::generate(&env);
+    let offering_sym = Symbol::new(&env, "offering");
+    let payout_asset = Address::generate(&env);
+    
+    // Setup offering
+    client.try_register_offering(
+        &issuer,
+        &namespace,
+        &token,
+        &10_000,
+        &offering_sym,
+        &18,
+        &payout_asset,
+        &0,
+    ).unwrap();
+
+    let holder = Address::generate(&env);
+    let share_class = Symbol::new(&env, "classA");
+    
+    // Set aggregate cap to 10
+    client.set_max_total_supply_shares(&issuer, &namespace, &token, &10);
+    
+    // Set class cap to 1
+    client.set_class_supply_cap(&issuer, &namespace, &token, &share_class, &1);
+    
+    // Issuance 1: Should pass, cap of exactly 1
+    client.set_holder_share(&issuer, &namespace, &token, &holder, &1, &Some(share_class.clone()));
+    
+    // Issuance 2: Should fail, class exhausted but aggregate has room (1 < 10)
+    let holder2 = Address::generate(&env);
+    let result = client.try_set_holder_share(&issuer, &namespace, &token, &holder2, &1, &Some(share_class.clone()));
+    
+    assert!(result.is_err());
 }

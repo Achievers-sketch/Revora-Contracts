@@ -181,16 +181,16 @@ fn pending_periods(
     holder: &Address,
 ) -> soroban_sdk::Vec<u64> {
     env.as_contract(revora_id, || {
-        let (periods, _) = RevoraRevenueShare::get_pending_periods_page(
+        RevoraRevenueShare::get_pending_periods_page(
             env.clone(),
             issuer.clone(),
             symbol_short!("def"),
             offering_token.clone(),
             holder.clone(),
             0,
-            200,
-        );
-        periods
+            50,
+        )
+        .0
     })
 }
 
@@ -224,13 +224,15 @@ fn setup_claim_fail() -> (
 
     revora.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &offering_token,
         &10_000,
         &fail_token_id,
         &0,
-        &None,
-    );
+        &symbol_short!(""),
+        &0);
     revora.set_holder_share(&issuer, &symbol_short!("def"), &offering_token, &holder, &10_000);
 
     // Mint to issuer and deposit — transfer direction is issuer→contract, not yet failing
@@ -441,28 +443,28 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
 
     // Register a second offering backed by a normal (unarmed) token so its claim succeeds.
     let offering_token_b = Address::generate(&env);
-    let admin_b = Address::generate(&env);
-    let payout_b = env.register_stellar_asset_contract(admin_b.clone());
-    soroban_sdk::token::StellarAssetClient::new(&env, &payout_b).mint(&issuer, &1_000_000);
+    let (token_b_id, token_b) = deploy_failing_token(&env);
+    token_b.mint(&issuer, &1_000_000);
 
     revora.register_offering(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
         &10_000,
-        &payout_b,
+        &token_b_id,
         &0,
-        &None,
-    );
+        &symbol_short!(""),
+        &0);
     revora.set_holder_share(&issuer, &symbol_short!("def"), &offering_token_b, &holder, &10_000);
-    // Mint and deposit so offering B has claimable revenue.
-    soroban_sdk::token::StellarAssetClient::new(&env, &normal_token.address())
-        .mint(&issuer, &500_000);
+    
+    // Mint payout tokens to the issuer so they can deposit revenue
+    soroban_sdk::token::StellarAssetClient::new(&env, &payout_b_id).mint(&issuer, &100_000);
+
     revora.deposit_revenue(
         &issuer,
         &symbol_short!("def"),
         &offering_token_b,
-        &payout_b,
+        &token_b_id,
         &100_000,
         &1,
     );

@@ -37,12 +37,15 @@ fn prove_distribution_normal_case() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder_a = Address::generate(&env);
     let holder_b = Address::generate(&env);
@@ -102,12 +105,15 @@ fn prove_distribution_digest_is_deterministic() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder_a = Address::generate(&env);
     let holder_b = Address::generate(&env);
@@ -158,12 +164,15 @@ fn prove_distribution_sorting_makes_order_invariant() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder_a = Address::generate(&env);
     let holder_b = Address::generate(&env);
@@ -227,7 +236,8 @@ fn prove_distribution_identical_bps_tie_break_by_address() {
         &1_000u32,
         &payment_token,
         &0i128,
-    );
+        &symbol_short!(""),
+        &0);
 
     // Generate addresses until we have two with the same BPS; the tie-break must be
     // by XDR address bytes ascending regardless of generation order.
@@ -298,6 +308,8 @@ fn prove_distribution_empty_holders() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
@@ -341,12 +353,15 @@ fn prove_distribution_unknown_period_id_returns_zero_payouts() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder_a = Address::generate(&env);
     client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &3_000u32);
@@ -391,12 +406,15 @@ fn prove_distribution_zero_share_bps_yields_zero_payout() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     mint(&env, &payment_token, &issuer, 10_000_000);
     client.deposit_revenue(
@@ -440,12 +458,15 @@ fn prove_distribution_usdc_6_decimals_normalizes_correctly() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     // Configure 6-decimal payment token (USDC-style)
     client.set_payment_token_decimals(&issuer, &symbol_short!("def"), &token, &6u32);
@@ -495,12 +516,15 @@ fn prove_distribution_respects_round_half_up_mode() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
     client.set_rounding_mode(&issuer, &symbol_short!("def"), &token, &RoundingMode::RoundHalfUp);
 
     let holder = Address::generate(&env);
@@ -538,12 +562,15 @@ fn prove_distribution_caps_at_max_chunk_periods() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     mint(&env, &payment_token, &issuer, 1_000_000);
     client.deposit_revenue(
@@ -585,12 +612,15 @@ fn prove_distribution_entry_fields_match() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder = Address::generate(&env);
     client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000u32);
@@ -635,12 +665,15 @@ fn prove_distribution_different_periods_produce_different_digests() {
 
     client.register_offering(
         &issuer,
+        &Vec::new(&env),
+        &1u32,
         &symbol_short!("def"),
         &token,
         &1_000u32,
         &payment_token,
         &0i128,
-    &None);
+        &symbol_short!(""),
+        &0);
 
     let holder = Address::generate(&env);
     client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &5_000u32);

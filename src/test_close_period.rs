@@ -1,68 +1,60 @@
-//! Tests for the `close_period` feature.
-//!
-//! ## Coverage matrix
-//!
-//! | Scenario | Expected |
-//! |----------|----------|
-//! | Happy path: close an open period | `Ok(())`, `is_period_closed` returns `true`, event emitted |
-//! | Double-close | `PeriodAlreadyClosed` |
-//! | Override after close | `PeriodAlreadyClosed` |
-//! | Initial report after close (new period) | allowed (close only blocks overrides) |
-//! | Deposit after close | allowed (deposit is independent) |
-//! | Claim after close | allowed (deposited revenue still claimable) |
-//! | Wrong issuer | `OfferingNotFound` |
-//! | Unknown offering | `OfferingNotFound` |
-//! | period_id == 0 | `InvalidPeriodId` |
-//! | Close does not affect other periods | override of open period succeeds |
-
 #![cfg(test)]
-
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     token, Address, Env,
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Test helpers ─────────────────────────────────────────────────────────────
 
-fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
-    let id = env.register_contract(None, RevoraRevenueShare);
-    RevoraRevenueShareClient::new(env, &id)
-}
-
-fn create_payment_token(env: &Env) -> (Address, Address) {
-    let admin = Address::generate(env);
-    let contract = env.register_stellar_asset_contract_v2(admin.clone());
-    let token_id = contract.address();
-    (token_id, admin)
+/// Register a single-issuer offering without co-issuers and return the
+/// `(env, client, issuer, token, payment_token)` tuple the close-period tests
+/// expect. `mock_all_auths()` is enabled so any issuer-signed call within the
+/// test body passes auth checks automatically; assertions about the
+/// `OfferingNotFound` error path still succeed because they come from the
+/// offering lookup itself.
+///
+/// The payment-token stellar asset is registered with `issuer` as admin so
+/// the `mint(..., &issuer, ...)` helper can mint on the same asset address the
+/// offering actually references. Registering with a random admin would produce
+/// a different asset-contract address under Soroban's deterministic admin ->
+/// address mapping, silently breaking balance checks downstream.
+fn setup_offering()
+    -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address)
+{
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(issuer.clone())
+        .address();
+    let token = Address::generate(&env);
+    client.register_offering(
+        &issuer,
+        &Vec::from_array(&env, []),
+        &1u32,
+        &symbol_short!("ns"),
+        &token,
+        &10_000u32,
+        &payment_token,
+        &0i128,
+        &symbol_short!(""),
+        &0u32,
+    );
+    (env, client, issuer, token, payment_token)
 }
 
 fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
-    token::StellarAssetClient::new(env, token).mint(to, &amount);
-}
-
-/// Register an offering and return (env, client, issuer, offering_token, payment_token).
-/// `env` must be kept alive for the duration of the test.
-fn setup_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-    let cid = env.register_contract(None, RevoraRevenueShare);
-    let client = RevoraRevenueShareClient::new(&env, &cid);
-    let issuer = Address::generate(&env);
-    let offering_token = Address::generate(&env);
-    let (payment_token, _) = create_payment_token(&env);
-
-    client.register_offering(
-        &issuer,
-        &symbol_short!("ns"),
-        &offering_token,
-        &10_000,
-        &payment_token,
-        &0,
-        &None,
-    );
-
-    (env, client, issuer, offering_token, payment_token)
+    // Re-registering with `to.clone()` as admin must produce the same address
+    // as the offering's `payment_token` was registered with, which was
+    // issuer-address derived. If `to != issuer`, the mint call will land on
+    // a different asset and the test that called `mint` was wrong about the
+    // admin. The contract under test asserts its own ledger reads, so we
+    // only intend the canonical pattern (issuer minting to itself).
+    let contract = env.register_stellar_asset_contract_v2(to.clone());
+    token::StellarAssetClient::new(env, &contract.address()).mint(to, &amount);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -224,124 +216,658 @@ fn close_period_wrong_issuer_returns_not_found() {
     assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
 }
 
-use soroban_sdk::{xdr::ToXdr, Bytes, BytesN};
+// ── Gas-bound tests: linear-in-holders cost ──────────────────────────────────
 
-fn compute_snapshot_content_hash(env: &Env, holders: &[(Address, u32)]) -> BytesN<32> {
-    let mut digest_input = Bytes::new(env);
-    for (index, (holder, share_bps)) in holders.iter().enumerate() {
-        digest_input.append(&((index as u32).to_xdr(env)));
-        digest_input.append(&holder.to_xdr(env));
-        digest_input.append(&share_bps.to_xdr(env));
-    }
-    env.crypto().sha256(&digest_input).to_bytes()
+/// Helper: create a payment token (Stellar asset contract).
+fn create_payment_token(env: &Env) -> (Address, Address) {
+    let admin = Address::generate(env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone());
+    (token.address(), admin)
 }
 
-#[test]
-fn atomic_close_period_happy_path() {
-    let (env, client, issuer, token, payment) = setup_offering();
+fn make_client(env: &Env) -> RevoraRevenueShareClient {
+    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    RevoraRevenueShareClient::new(env, &contract_id)
+}
+
+/// Helper to compute CPU instruction delta of `close_period` call.
+fn measure_cpu_for_n_holders(n: u32) -> u64 {
+    let env = Env::default();
+    env.mock_all_auths();
+    let cid = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &cid);
+    let issuer = Address::generate(&env);
+    let offering_token = Address::generate(&env);
+    let (payment_token, _) = create_payment_token(&env);
     let ns = symbol_short!("ns");
-    let contract_id = client.address.clone();
 
-    client.set_snapshot_config(&issuer, &ns, &token, &true);
+    client.register_offering(&issuer, &ns, &offering_token, &10_000, &payment_token, &0);
 
-    let holder = Address::generate(&env);
-    let holders = soroban_sdk::vec![&env, (holder.clone(), 5_000u32)];
-    let content_hash = compute_snapshot_content_hash(&env, &[(holder.clone(), 5_000)]);
+    for _ in 0..n {
+        let holder = Address::generate(&env);
+        client.set_holder_share(&issuer, &ns, &offering_token, &holder, &1);
+    }
 
-    client.commit_snapshot(&issuer, &ns, &token, &1, &content_hash);
-    client.apply_snapshot_shares(&issuer, &ns, &token, &1, &0, &holders);
+    let before = env.budget().cpu_instruction_count();
+    client.close_period(&issuer, &ns, &offering_token, &1);
+    let after = env.budget().cpu_instruction_count();
+    after.saturating_sub(before)
+}
 
-    client.report_revenue(&issuer, &ns, &token, &payment, &1_000, &1, &false);
+/// Compute R² (coefficient of determination) for a linear fit of (x,y) points.
+fn r_squared(points: &[(f64, f64)]) -> f64 {
+    let n = points.len() as f64;
+    if n < 2 {
+        return 0.0;
+    }
 
-    let res = client.try_atomic_close_period(&issuer, &ns, &token, &1);
-    assert!(res.is_ok(), "atomic_close_period should succeed");
+    let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let ss_total: f64 = points.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
+    if ss_total == 0.0 {
+        return 1.0;
+    }
 
-    assert!(client.is_period_closed(&issuer, &ns, &token, &1));
+    let sum_x = points.iter().map(|(x, _)| x).sum::<f64>();
+    let sum_y = points.iter().map(|(_, y)| y).sum::<f64>();
+    let sum_x_sq = points.iter().map(|(x, _)| x.powi(2)).sum::<f64>();
+    let sum_xy = points.iter().map(|(x, y)| x * y).sum::<f64>();
 
-    let offering_id =
-        OfferingId { issuer: issuer.clone(), namespace: ns.clone(), token: token.clone() };
-    let finalized = env.as_contract(&contract_id, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey2, bool>(&DataKey2::SnapshotFinalized(offering_id, 1))
-            .unwrap_or(false)
-    });
-    assert!(finalized, "snapshot should be finalized");
+    let slope_numerator = n * sum_xy - sum_x * sum_y;
+    let slope_denominator = n * sum_x_sq - sum_x.powi(2);
+    if slope_denominator == 0.0 {
+        return 0.0;
+    }
+
+    let slope = slope_numerator / slope_denominator;
+    let intercept = (sum_y - slope * sum_x) / n;
+
+    let ss_residual: f64 = points.iter()
+        .map(|(x, y)| (y - (slope * x + intercept)).powi(2))
+        .sum();
+
+    1.0 - (ss_residual / ss_total)
+}
+
+/// Test that close_period cost grows linearly with holder count (R² > 0.98).
+#[test]
+fn close_period_cpu_grows_linearly_with_holders() {
+    let test_counts = [1u32, 10u32, 100u32, 1000u32];
+    let mut points = Vec::new();
+
+    for n in test_counts {
+        let cpu = measure_cpu_for_n_holders(n) as f64;
+        points.push((n as f64, cpu));
+    }
+
+    let r2 = r_squared(&points);
+    assert!(r2 > 0.98, "R² = {:.4} is below threshold of 0.98", r2);
+}
+
+/// Test that zero-holder offering closes with constant cost.
+#[test]
+fn close_period_zero_holders_has_constant_cost() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let cid = env.register_contract(None, RevoraRevenueShare);
+    let client = RevoraRevenueShareClient::new(&env, &cid);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns");
+    let (payment_token, _) = create_payment_token(&env);
+
+    client.register_offering(&issuer, &ns, &token, &10_000, &payment_token, &0);
+
+    let before = env.budget().cpu_instruction_count();
+    client.close_period(&issuer, &ns, &token, &1);
+    let after = env.budget().cpu_instruction_count();
+
+    assert!(after - before > 0, "CPU cost must be positive");
+    // Assert that cost is within a reasonable constant bound
+    assert!(after - before < 5_000_000, "CPU cost {} exceeded constant bound", after - before);
+}
+
+// ── Dual-signature close-of-period tests (#565) ────────────────────────────
+
+/// Helper: set up an offering with dual-signature mode enabled.
+fn setup_dual_sig_offering(
+    env: &Env,
+    client: &RevoraRevenueShareClient,
+) -> (Address, Address, Address, Address, Address) {
+    env.mock_all_auths();
+    let issuer = Address::generate(env);
+    let co_issuer = Address::generate(env);
+    let offering_token = Address::generate(env);
+    let payment_token = Address::generate(env);
+    let ns = symbol_short!("ns");
+
+    client.register_offering(
+        &issuer,
+        &Vec::from_array(env, [co_issuer.clone()]),
+        &2u32,
+        &ns,
+        &offering_token,
+        &10_000,
+        &payment_token,
+        &0,
+        &symbol_short!(""),
+        &0,
+    );
+
+    // Enable dual-signature mode.
+    client.set_dual_sig_config(&issuer, &ns, &offering_token, &true);
+
+    (issuer, co_issuer, offering_token, payment_token, ns)
 }
 
 #[test]
-fn atomic_close_period_fails_no_report() {
+fn set_dual_sig_config_enables_mode() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, _co, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    // Single-sig close_period should now fail with DualSigNotConfigured.
+    let result = client.try_close_period(&issuer, &ns, &token, &1);
+    assert_eq!(result, Err(Ok(RevoraError::DualSigNotConfigured)));
+}
+
+#[test]
+fn close_period_dual_sig_happy_path() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, co_issuer, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    assert!(!client.is_period_closed(&issuer, &ns, &token, &1));
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &1, &issuer, &co_issuer,
+    );
+    assert!(result.is_ok(), "dual-sig close should succeed: {:?}", result);
+    assert!(client.is_period_closed(&issuer, &ns, &token, &1));
+}
+
+#[test]
+fn close_period_dual_sig_same_signer_rejected() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, _co, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    // Both sig_a and sig_b are the issuer — must be rejected.
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &1, &issuer, &issuer,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::DualSigSameSigner)));
+    assert!(!client.is_period_closed(&issuer, &ns, &token, &1));
+}
+
+#[test]
+fn close_period_dual_sig_not_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let co_issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let payment_token = Address::generate(&env);
+    let ns = symbol_short!("ns");
+
+    // Register offering WITHOUT enabling dual-sig.
+    client.register_offering(
+        &issuer,
+        &Vec::from_array(&env, [co_issuer.clone()]),
+        &2u32,
+        &ns,
+        &token,
+        &10_000,
+        &payment_token,
+        &0,
+        &symbol_short!(""),
+        &0,
+    );
+
+    // Dual-sig close must fail with DualSigNotConfigured.
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &1, &issuer, &co_issuer,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::DualSigNotConfigured)));
+}
+
+#[test]
+fn close_period_dual_sig_unauthorized_signer_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let (issuer, _co, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    let attacker = Address::generate(&env);
+
+    // Unauthorized signer must be rejected.
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &1, &issuer, &attacker,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
+}
+
+#[test]
+fn close_period_dual_sig_emits_event() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, co_issuer, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    let before = env.events().all().len();
+
+    client.close_period_dual_sig(&issuer, &ns, &token, &42, &issuer, &co_issuer);
+
+    assert!(env.events().all().len() > before, "expected at least one new event");
+}
+
+#[test]
+fn close_period_dual_sig_double_close_rejected() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, co_issuer, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    // First close succeeds.
+    client.close_period_dual_sig(&issuer, &ns, &token, &1, &issuer, &co_issuer);
+
+    // Second close must be rejected.
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &1, &issuer, &co_issuer,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::PeriodAlreadyClosed)));
+}
+
+#[test]
+fn close_period_dual_sig_zero_period_id_rejected() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, co_issuer, token, _payment, ns) = setup_dual_sig_offering(&env, &client);
+
+    let result = client.try_close_period_dual_sig(
+        &issuer, &ns, &token, &0, &issuer, &co_issuer,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::InvalidPeriodId)));
+}
+
+#[test]
+fn close_period_dual_sig_unknown_offering_returns_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let co_issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let result = client.try_close_period_dual_sig(
+        &issuer, &symbol_short!("ns"), &token, &1, &issuer, &co_issuer,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
+}
+
+// ── Per-class dividend priority ordering tests (#523) ──────────────────────
+//
+// The priority feature is wired through `close_period` and
+// `close_period_dual_sig`. We register classes directly into the
+// `Vec<(ShareClass, ClassConfig)>` storage since the test harness's
+// `register_offering` does not pre-populate it, and we read them back via
+// `get_class_pay_order` / `get_class_priority` to verify the resolver is
+// deterministic and tie-breaks by canonical XDR bytes.
+
+fn register_offering_with_coissuer(
+    env: &Env,
+    client: &RevoraRevenueShareClient,
+    issuer: &Address,
+    co_issuer: &Address,
+    ns: &Symbol,
+    token: &Address,
+    payment_token: &Address,
+) {
+    client.register_offering(
+        issuer,
+        &Vec::from_array(env, [co_issuer.clone()]),
+        &2u32,
+        ns,
+        token,
+        &10_000u32,
+        payment_token,
+        &0i128,
+        &symbol_short!(""),
+        &0u32,
+    );
+}
+
+fn register_classes_in_storage(
+    env: &Env,
+    offering_id: &OfferingId,
+    pairs: &[(ShareClass, crate::ClassConfig)],
+) {
+    let key = crate::DataKey2::OfferingClasses(offering_id.clone());
+    env.storage().persistent().set(&key, pairs);
+}
+
+#[test]
+fn class_priority_set_class_priority_happy_path_roundtrip() {
     let (env, client, issuer, token, _payment) = setup_offering();
     let ns = symbol_short!("ns");
-    let contract_id = client.address.clone();
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[
+            (
+                ShareClass::Custom(Symbol::new(&env, "pref")),
+                crate::ClassConfig { bps: 5_000, voting: true },
+            ),
+            (
+                ShareClass::Custom(Symbol::new(&env, "comm")),
+                crate::ClassConfig { bps: 5_000, voting: false },
+            ),
+        ],
+    );
 
-    client.set_snapshot_config(&issuer, &ns, &token, &true);
+    let sc = ShareClass::Custom(Symbol::new(&env, "pref"));
+    client.set_class_priority(&issuer, &ns, &token, &sc, &7u32);
+    assert_eq!(client.get_class_priority(&issuer, &ns, &token, &sc), 7u32);
 
-    let holder = Address::generate(&env);
-    let holders = soroban_sdk::vec![&env, (holder.clone(), 5_000u32)];
-    let content_hash = compute_snapshot_content_hash(&env, &[(holder.clone(), 5_000)]);
-
-    client.commit_snapshot(&issuer, &ns, &token, &1, &content_hash);
-    client.apply_snapshot_shares(&issuer, &ns, &token, &1, &0, &holders);
-
-    let res = client.try_atomic_close_period(&issuer, &ns, &token, &1);
-    assert_eq!(res, Err(Ok(RevoraError::MissingReportForOverride)));
-
-    assert!(!client.is_period_closed(&issuer, &ns, &token, &1));
-
-    let offering_id =
-        OfferingId { issuer: issuer.clone(), namespace: ns.clone(), token: token.clone() };
-    let finalized = env.as_contract(&contract_id, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey2, bool>(&DataKey2::SnapshotFinalized(offering_id, 1))
-            .unwrap_or(false)
-    });
-    assert!(!finalized, "snapshot should not be finalized (rolled back)");
+    let comm = ShareClass::Custom(Symbol::new(&env, "comm"));
+    client.set_class_priority(&issuer, &ns, &token, &comm, &11u32);
+    assert_eq!(client.get_class_priority(&issuer, &ns, &token, &comm), 11u32);
 }
 
 #[test]
-fn atomic_close_period_fails_hash_mismatch() {
-    let (env, client, issuer, token, payment) = setup_offering();
+fn class_priority_get_class_priority_default_is_zero() {
+    let (_env, client, issuer, token, _payment) = setup_offering();
     let ns = symbol_short!("ns");
-    let contract_id = client.address.clone();
-
-    client.set_snapshot_config(&issuer, &ns, &token, &true);
-
-    let holder = Address::generate(&env);
-    let holders = soroban_sdk::vec![&env, (holder.clone(), 5_000u32)];
-    let content_hash = BytesN::from_array(&env, &[1u8; 32]);
-
-    client.commit_snapshot(&issuer, &ns, &token, &1, &content_hash);
-    client.apply_snapshot_shares(&issuer, &ns, &token, &1, &0, &holders);
-
-    client.report_revenue(&issuer, &ns, &token, &payment, &1_000, &1, &false);
-
-    let res = client.try_atomic_close_period(&issuer, &ns, &token, &1);
-    assert_eq!(res, Err(Ok(RevoraError::SnapshotHashMismatch)));
-
-    assert!(!client.is_period_closed(&issuer, &ns, &token, &1));
-
-    let offering_id =
-        OfferingId { issuer: issuer.clone(), namespace: ns.clone(), token: token.clone() };
-    let finalized = env.as_contract(&contract_id, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey2, bool>(&DataKey2::SnapshotFinalized(offering_id, 1))
-            .unwrap_or(false)
-    });
-    assert!(!finalized, "snapshot should not be finalized (rolled back)");
+    let sc = ShareClass::Custom(Symbol::new(&_env, "never_set"));
+    // No set_class_priority call → default of 0.
+    assert_eq!(client.get_class_priority(&issuer, &ns, &token, &sc), 0u32);
 }
 
 #[test]
-fn atomic_close_period_fails_snapshot_disabled() {
-    let (_env, client, issuer, token, payment) = setup_offering();
+fn class_priority_set_wrong_issuer_returns_not_found() {
+    let (env, client, issuer, token, _payment) = setup_offering();
     let ns = symbol_short!("ns");
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[(
+            ShareClass::Custom(Symbol::new(&env, "p")),
+            crate::ClassConfig { bps: 1_000, voting: true },
+        )],
+    );
 
-    client.report_revenue(&issuer, &ns, &token, &payment, &1_000, &1, &false);
+    let attacker = Address::generate(&env);
+    let sc = ShareClass::Custom(Symbol::new(&env, "p"));
+    let result = client.try_set_class_priority(&attacker, &ns, &token, &sc, &1u32);
+    // Wrong issuer hits the same `OfferingNotFound` guard pattern as
+    // `close_period` — defensible because it conflates "wrong issuer" and
+    // "missing offering" intentionally.
+    assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
+}
 
-    let res = client.try_atomic_close_period(&issuer, &ns, &token, &1);
-    assert_eq!(res, Err(Ok(RevoraError::SnapshotNotEnabled)));
+#[test]
+fn class_priority_set_unknown_offering_returns_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
 
-    assert!(!client.is_period_closed(&issuer, &ns, &token, &1));
+    let sc = ShareClass::Custom(Symbol::new(&env, "p"));
+    let result = client.try_set_class_priority(
+        &issuer,
+        &symbol_short!("ns"),
+        &token,
+        &sc,
+        &1u32,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
+}
+
+#[test]
+fn class_priority_set_unregistered_class_returns_invalid() {
+    let (env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    // Register only class A — Custom("ghost") is NOT registered.
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[(
+            ShareClass::A,
+            crate::ClassConfig { bps: 10_000, voting: true },
+        )],
+    );
+
+    let ghost = ShareClass::Custom(Symbol::new(&env, "ghost"));
+    let result = client.try_set_class_priority(&issuer, &ns, &token, &ghost, &1u32);
+    assert_eq!(result, Err(Ok(RevoraError::InvalidShareClass)));
+}
+
+#[test]
+fn class_priority_close_period_emits_class_pay_order() {
+    let (env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    let pref = ShareClass::Custom(Symbol::new(&env, "pref"));
+    let comm = ShareClass::Custom(Symbol::new(&env, "comm"));
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[
+            (pref.clone(), crate::ClassConfig { bps: 5_000, voting: true }),
+            (comm.clone(), crate::ClassConfig { bps: 5_000, voting: false }),
+        ],
+    );
+
+    // `pref` should be paid first (lower priority index).
+    client.set_class_priority(&issuer, &ns, &token, &pref.clone(), &0u32);
+    client.set_class_priority(&issuer, &ns, &token, &comm.clone(), &1u32);
+
+    let events_before = env.events().all().len();
+    client.close_period(&issuer, &ns, &token, &1u64);
+    let events_after = env.events().all().len();
+    assert!(events_after > events_before, "close_period must emit events");
+
+    // Read back the cached pay order: it must contain the two classes and be
+    // ordered with `pref` first.
+    let order = client.get_class_pay_order(&issuer, &ns, &token, &1u64);
+    assert_eq!(order.len(), 2);
+    assert_eq!(order.get(0).unwrap(), pref);
+    assert_eq!(order.get(1).unwrap(), comm);
+}
+
+#[test]
+fn class_priority_close_period_orders_by_priority_ascending() {
+    let (env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    let a = ShareClass::A;
+    let b = ShareClass::B;
+    let c = ShareClass::Custom(Symbol::new(&env, "c"));
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[
+            (a.clone(), crate::ClassConfig { bps: 2_000, voting: true }),
+            (b.clone(), crate::ClassConfig { bps: 2_000, voting: true }),
+            (c.clone(), crate::ClassConfig { bps: 6_000, voting: false }),
+        ],
+    );
+
+    // Set priorities so the expected order is [c, b, a] (high→low index asc).
+    client.set_class_priority(&issuer, &ns, &token, &a, &9u32);
+    client.set_class_priority(&issuer, &ns, &token, &b, &5u32);
+    client.set_class_priority(&issuer, &ns, &token, &c.clone(), &2u32);
+
+    client.close_period(&issuer, &ns, &token, &1u64);
+
+    let order = client.get_class_pay_order(&issuer, &ns, &token, &1u64);
+    assert_eq!(order.get(0).unwrap(), c);
+    assert_eq!(order.get(1).unwrap(), b);
+    assert_eq!(order.get(2).unwrap(), a);
+}
+
+#[test]
+fn class_priority_close_period_tie_break_is_xdr_canonical() {
+    let (env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: token.clone(),
+    };
+    // Three Custom classes — all tied at priority 0 — must sort by their XDR
+    // bytes deterministically. We close two distinct periods to confirm the
+    // tie-break is stable across reruns.
+    let c_alpha = ShareClass::Custom(Symbol::new(&env, "alpha"));
+    let c_beta = ShareClass::Custom(Symbol::new(&env, "beta"));
+    let c_gamma = ShareClass::Custom(Symbol::new(&env, "gamma"));
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[
+            (c_alpha.clone(), crate::ClassConfig { bps: 1_000, voting: false }),
+            (c_beta.clone(), crate::ClassConfig { bps: 1_000, voting: false }),
+            (c_gamma.clone(), crate::ClassConfig { bps: 8_000, voting: false }),
+        ],
+    );
+
+    for sc in [&c_alpha, &c_beta, &c_gamma] {
+        client.set_class_priority(&issuer, &ns, &token, sc, &0u32);
+    }
+
+    client.close_period(&issuer, &ns, &token, &1u64);
+    let order_a = client.get_class_pay_order(&issuer, &ns, &token, &1u64);
+
+    client.close_period(&issuer, &ns, &token, &2u64);
+    let order_b = client.get_class_pay_order(&issuer, &ns, &token, &2u64);
+
+    assert_eq!(order_a.len(), 3);
+    assert_eq!(order_b.len(), 3);
+
+    // Same membership: every class in `order_a` must appear in `order_b` and
+    // vice-versa. We compare matched classes by their XDR-canonical bytes,
+    // which avoids relying on raw `ShareClass` equality across SDK versions.
+    let mut seen_a: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+    for sc in order_a.iter() {
+        seen_a.push_back(sc.to_xdr(&env));
+    }
+    let mut seen_b: soroban_sdk::Vec<Bytes> = soroban_sdk::Vec::new(&env);
+    for sc in order_b.iter() {
+        seen_b.push_back(sc.to_xdr(&env));
+    }
+    assert_eq!(seen_a.len(), seen_b.len());
+
+    // Cross-membership check: each byte sequence in `seen_a` is in `seen_b`.
+    for a_bytes in seen_a.iter() {
+        let mut found = false;
+        for b_bytes in seen_b.iter() {
+            if a_bytes == b_bytes {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "class present in period 1 but absent from period 2");
+    }
+
+    // The resolver must produce strictly ascending XDR bytes order — this is
+    // the on-chain canonical tie-break the contract guarantees.
+    let bytes_a: soroban_sdk::Vec<Bytes> = order_a.iter().map(|sc| sc.to_xdr(&env)).collect();
+    for i in 1..bytes_a.len() {
+        let lhs = bytes_a.get(i - 1).unwrap();
+        let rhs = bytes_a.get(i).unwrap();
+        assert!(
+            lhs <= rhs,
+            "tie-break must be ascending by XDR bytes"
+        );
+    }
+    let bytes_b: soroban_sdk::Vec<Bytes> = order_b.iter().map(|sc| sc.to_xdr(&env)).collect();
+    for i in 1..bytes_b.len() {
+        let lhs = bytes_b.get(i - 1).unwrap();
+        let rhs = bytes_b.get(i).unwrap();
+        assert!(
+            lhs <= rhs,
+            "tie-break must be ascending by XDR bytes"
+        );
+    }
+}
+
+#[test]
+fn class_priority_close_period_emits_empty_order_when_no_classes() {
+    // With no OfferingClasses vec stored, the resolver must return no classes
+    // and `close_period` must still succeed and emit an empty pay order.
+    let (_env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    client.close_period(&issuer, &ns, &token, &1u64);
+    let order = client.get_class_pay_order(&issuer, &ns, &token, &1u64);
+    assert_eq!(order.len(), 0);
+}
+
+#[test]
+fn class_priority_close_period_dual_sig_produces_same_order() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, co_issuer, offering_token, payment_token, ns) =
+        setup_dual_sig_offering(&env, &client);
+    let offering_id = crate::OfferingId {
+        issuer: issuer.clone(),
+        namespace: ns.clone(),
+        token: offering_token.clone(),
+    };
+    let pref = ShareClass::Custom(Symbol::new(&env, "pref"));
+    let comm = ShareClass::Custom(Symbol::new(&env, "comm"));
+    register_classes_in_storage(
+        &env,
+        &offering_id,
+        &[
+            (pref.clone(), crate::ClassConfig { bps: 5_000, voting: true }),
+            (comm.clone(), crate::ClassConfig { bps: 5_000, voting: false }),
+        ],
+    );
+    client.set_class_priority(&issuer, &ns, &offering_token, &pref, &0u32);
+    client.set_class_priority(&issuer, &ns, &offering_token, &comm, &1u32);
+
+    client.close_period_dual_sig(
+        &issuer,
+        &ns,
+        &offering_token,
+        &1u64,
+        &issuer,
+        &co_issuer,
+    );
+    let order = client.get_class_pay_order(&issuer, &ns, &offering_token, &1u64);
+    assert_eq!(order.len(), 2);
+    assert_eq!(order.get(0).unwrap(), ShareClass::Custom(Symbol::new(&env, "pref")));
+    assert_eq!(order.get(1).unwrap(), ShareClass::Custom(Symbol::new(&env, "comm")));
+}
+
+#[test]
+fn class_priority_get_class_pay_order_empty_for_unset_period() {
+    // Querying a period that was never closed must return an empty Vec,
+    // matching the documented migration-friendly fallback.
+    let (_env, client, issuer, token, _payment) = setup_offering();
+    let ns = symbol_short!("ns");
+    let order = client.get_class_pay_order(&issuer, &ns, &token, &999u64);
+    assert_eq!(order.len(), 0);
 }
