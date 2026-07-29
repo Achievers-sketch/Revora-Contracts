@@ -119,12 +119,13 @@ const CORE_LAYOUT: &[StorageLayoutEntry] = storage_layout_entries!("revora_reven
     ("DataKey2::DualSigEnabled(OfferingId)", "bool", "offering"),
     ("DataKey2::AdminRotationLog(u64)", "AdminRotationEntry", "contract"),
     ("DataKey2::AdminRotationCount", "u64", "contract"),
-    ("DataKey2::ClassConversionRatio(OfferingId, ShareClass, ShareClass)", "u32", "offering"),
+    ("DataKey2::ClassConversionRatio(OfferingId, ShareClass, ShareClass)", "u32", "offering+class"),
     ("DataKey2::EmitV2Compat", "bool", "contract"),
-    ("DataKey2::GovernanceProposalCount(OfferingId)", "u32", "offering"),
     ("DataKey2::GovernanceProposal(OfferingId, u32)", "GovernanceProposal", "offering+proposal"),
-    ("DataKey2::GovernanceProposalMeta(OfferingId, BytesN<32>)", "bool", "offering+hash"),
+    ("DataKey2::GovernanceProposalCount(OfferingId)", "u32", "offering"),
+    ("DataKey2::GovernanceProposalMeta(OfferingId, BytesN<32>)", "bool", "offering+proposal"),
     ("DataKey2::OraclePubKey(Address)", "BytesN<32>", "address"),
+    ("DataKey::SnapshotHolderShare(OfferingId, u64, Address)", "u32", "offering+snapshot+holder"),
     ("MigrationDataKey::LastMigrationCompletedAt(Address)", "u32", "issuer"),
     ("MigrationDataKey::MigrationResumeCursor(Address)", "u32", "issuer")
 ]);

@@ -155,7 +155,7 @@ pub enum RevoraError {
     /// `display_decimals` exceeds the maximum allowed precision of 18.
     ///
     /// Wire value: 51. Stable since v1.
-    DisplayDecimalsOutOfRange = 34,
+    DisplayDecimalsOutOfRange = 51,
     /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
     /// A transfer is already pending for this offering.
@@ -269,8 +269,42 @@ pub enum RevoraError {
     /// (offering_id, holder) pair. Replayed or out-of-order `set_holder_share` calls are
     /// rejected to prevent stale off-chain updates from overwriting newer on-chain state.
     ///
-    /// Wire value: 62. Stable since the nonce-guard release.
-    StaleNonce = 62,
+    /// Wire value: 62. Stable since v1.
+    OracleQuoteStale = 62,
+    /// All oracles in the oracle chain returned stale quotes; no fresh quote is available.
+    ///
+    /// Wire value: 63. Stable since v1.
+    AllOraclesStale = 63,
+
+    // ── Feature extension codes (64–99) ──────────────────────────────────────
+    /// Caller is only permitted in testnet mode (e.g. faucet endpoints).
+    TestnetOnly = 64,
+    /// The holder's address is individually frozen for this offering.
+    HolderFrozen = 65,
+    /// The provided share class identifier is not valid for this offering.
+    InvalidShareClass = 66,
+    /// Share class bps allocation is invalid (e.g. > 10 000).
+    InvalidShareClassBps = 67,
+    /// The conversion ratio supplied for class conversion is invalid.
+    InvalidConversionRatio = 68,
+    /// The platform fee would exceed the remaining holder-share headroom.
+    FeeExceedsHolderShare = 69,
+    /// Adding to a transfer-restriction category would exceed its configured cap.
+    CategoryCapReached = 70,
+    /// The requested class conversion has not been approved.
+    ConversionNotApproved = 71,
+    /// Conversion is blocked because the holder still has unvested tokens.
+    UnvestedConversionBlocked = 72,
+    /// The stored freeze reason does not match the reason supplied for unfreeze.
+    FreezeReasonMismatch = 73,
+    /// The holder does not have sufficient class balance for the requested operation.
+    InsufficientClassBalance = 74,
+    /// Current time is outside the configured redemption window.
+    RedemptionWindowClosed = 75,
+    /// `display_decimals` does not match the on-chain payment token's `decimals()`.
+    ///
+    /// Wire value: 76. Stable since v1.
+    DecimalsMismatch = 76,
 }
 
 pub mod vesting;
@@ -2163,9 +2197,6 @@ impl RevoraRevenueShare {
                     found = true;
                     break;
                 }
-            }
-            if !found {
-                return Err(RevoraError::InvalidShareClass);
             }
         }
 
@@ -4129,6 +4160,18 @@ impl RevoraRevenueShare {
         // Prevents callers from supplying nonsensical precision that confuses downstream display.
         if display_decimals > MAX_TOKEN_DECIMALS {
             return Err(RevoraError::DisplayDecimalsOutOfRange);
+        }
+
+        // Decimals consistency guard (#612): query the on-chain payout_asset's
+        // decimals() and compare with display_decimals. If the token contract
+        // reverts on decimals() (e.g. non-StellarAsset tokens), skip the check
+        // to remain robust to exotic token implementations.
+        if let Ok(on_chain_decimals) =
+            token::Client::new(&env, &payout_asset).try_decimals()
+        {
+            if on_chain_decimals != display_decimals {
+                return Err(RevoraError::DecimalsMismatch);
+            }
         }
 
         // Skip bps validation in testnet mode (reads the real flag from storage).
@@ -7851,7 +7894,6 @@ impl RevoraRevenueShare {
             holder,
             share_bps,
             Some(share_class),
-            None,
         )
     }
     ///
@@ -13210,7 +13252,7 @@ impl RevoraRevenueShare {
         }
         Ok(())
     }
-} // end impl RevoraRevenueShare (migration)
+}
 
 // ── Contract self-test entrypoint (#618) ─────────────────────────────────────
 #[contractimpl]
