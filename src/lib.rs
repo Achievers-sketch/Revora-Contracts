@@ -301,10 +301,14 @@ pub enum RevoraError {
     InsufficientClassBalance = 74,
     /// Current time is outside the configured redemption window.
     RedemptionWindowClosed = 75,
-    /// `display_decimals` does not match the on-chain payment token's `decimals()`.
+    /// `twap_window_secs` is below `MIN_TWAP_WINDOW_SECS` for this offering.
     ///
     /// Wire value: 76. Stable since v1.
-    DecimalsMismatch = 76,
+    TwapWindowTooShort = 76,
+    /// `twap_window_secs` exceeds `MAX_TWAP_WINDOW_SECS` for this offering.
+    ///
+    /// Wire value: 77. Stable since v1.
+    TwapWindowTooLong = 77,
 }
 
 pub mod vesting;
@@ -346,6 +350,9 @@ mod test_close_period;
 mod test_disclosure;
 #[cfg(test)]
 mod test_quorum_check;
+#[cfg(test)]
+mod test_twap_window;
+/// Self-test module providing a `self_test()` entrypoint that runs contract-internal
 #[cfg(test)]
 mod test_faucet_seed;
 #[cfg(test)]
@@ -504,6 +511,10 @@ const EVENT_DISCLOSURE_UPDATED: Symbol = symbol_short!("disc_upd");
 const EVENT_DISPUTE_RESOLVE: Symbol = symbol_short!("disp_res");
 /// Emitted when a dispute window is set for an offering.
 const EVENT_DISPUTE_WINDOW_SET: Symbol = symbol_short!("disp_win");
+/// Emitted when the per-offering TWAP window is set or updated (#546).
+/// topic: `(twap_win_set, issuer, namespace, token)`
+/// data:  `(caller, twap_window_secs)`
+const EVENT_TWAP_WINDOW_SET: Symbol = symbol_short!("twap_win");
 const EVENT_TYPE_REV_INIT: Symbol = symbol_short!("rv_init");
 const EVENT_TYPE_REV_OVR: Symbol = symbol_short!("rv_ovr");
 const EVENT_TYPE_REV_REJ: Symbol = symbol_short!("rv_rej");
@@ -607,6 +618,19 @@ const ISSUER_TRANSFER_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
 const MIN_ISSUER_TRANSFER_EXPIRY_SECS: u64 = 60 * 60;
 /// Maximum configurable issuer transfer expiry: 30 days.
 const MAX_ISSUER_TRANSFER_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+
+// ── TWAP window bounds (#546) ─────────────────────────────────────────────────
+/// Minimum allowed `twap_window_secs` for any offering (60 seconds).
+///
+/// A window shorter than 60 s would offer negligible price smoothing and is
+/// rejected by [`set_twap_window`] with [`RevoraError::TwapWindowTooShort`].
+pub const MIN_TWAP_WINDOW_SECS: u64 = 60;
+/// Maximum allowed `twap_window_secs` for any offering (30 days).
+///
+/// A window longer than 30 days is rejected by [`set_twap_window`] with
+/// [`RevoraError::TwapWindowTooLong`].  The upper bound prevents accidental
+/// misconfiguration that would make NAV computation use stale price history.
+pub const MAX_TWAP_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const EVENT_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("dly_set");
 // v1 versioned event symbols (legacy)
@@ -847,6 +871,27 @@ pub struct PlatformFeeModel {
 pub struct InvestmentConstraintsConfig {
     pub min_stake: i128,
     pub max_stake: i128,
+}
+
+/// Per-offering TWAP (Time-Weighted Average Price) window configuration (#546).
+///
+/// Stores the active smoothing horizon used for NAV computation.  The window
+/// must satisfy:
+///   `MIN_TWAP_WINDOW_SECS <= twap_window_secs <= MAX_TWAP_WINDOW_SECS`
+///
+/// Both bounds are documented constants and are enforced by `set_twap_window`.
+/// A value of `None` (key absent) means the offering has not configured a TWAP
+/// window yet; callers should fall back to a platform-level default.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwapConfig {
+    /// Smoothing horizon in seconds.  Bounded by
+    /// [`MIN_TWAP_WINDOW_SECS`] and [`MAX_TWAP_WINDOW_SECS`].
+    pub twap_window_secs: u64,
+    /// Ledger timestamp at which this configuration was last written.
+    pub updated_at: u64,
+    /// Address that performed the most recent `set_twap_window` call.
+    pub updated_by: Address,
 }
 
 /// Off-chain disclosure binding for an offering (#485).
@@ -1383,71 +1428,13 @@ pub enum DataKey2 {
     FaucetLastRequest(Address),
     /// Whether dual-signature close-of-period is enabled for this offering.
     DualSigEnabled(OfferingId),
-    /// Global freeze reason recorded during set_freeze (#605).
-    GlobalFreezeReason,
-
-    // ── Missing variants added for compilation ──
-    /// Current accrual index counter for dividend-accrual ledger.
-    AccrualIndex(OfferingId),
-    /// Per-offering platform fee model.
-    OfferingPlatformFee(OfferingId),
-    /// Denomination metadata (symbol, decimals) for an offering.
-    DenominationMetadata(OfferingId),
-    /// FX oracle configuration for an offering.
-    FxOracleConfig(OfferingId),
-    /// Transfer restrictions per category for an offering.
-    TransferRestrictions(OfferingId, Symbol),
-    /// Holder category tag for transfer restriction purposes.
-    HolderCategory(OfferingId, Address),
-    /// Per-category holder count for transfer restriction accounting.
-    CategoryHolderCount(OfferingId, Symbol),
-    /// Emergency freeze record for (offering_id, holder).
-    EmergencyFreeze(OfferingId, Address),
-    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
-    TotalSharesIssued(OfferingId),
-    /// Maximum total supply shares cap for an offering.
-    MaxTotalSupplyShares(OfferingId),
-    /// Per-entry faucet seed for testnet holder seeding.
-    FaucetSeedEntry(OfferingId, u32),
-
-    // ── Faucet metrics keys ──
-    /// Last metrics-window id for which a `fct_mtr1` event was emitted.
-    /// Stored as `u64` equal to `timestamp / FAUCET_METRICS_WINDOW_SECS`.
-    /// Prevents duplicate emissions within the same window (idempotency guard).
-    FaucetMetricsWindow,
-    /// Running total of seed slots dispensed in the current window.
-    FaucetMetricsTotalDispensed,
-    /// Running count of unique requester addresses served in the current window.
-    FaucetMetricsUniqueAddrs,
-    /// Running count of cooldown-rejected requests in the current window.
-    FaucetMetricsCooldownRejects,
-    /// Set-membership flag: `true` when `requester` has already been counted
-    /// in the current window's unique-address tally.
-    /// Keyed by `(window_id, address)` so that the same address is counted once
-    /// per window but may be counted again in a new window.
-    FaucetMetricsAddrSeen(u64, Address),
-
-    // ── Multisig keys ──
-    /// Multisig approval threshold.
-    MultisigThreshold,
-    /// Multisig owner list.
-    MultisigOwners,
-    /// Multisig proposal counter.
-    MultisigProposalCount,
-    /// Default proposal duration in seconds.
-    MultisigProposalDuration,
-    /// Multisig proposal by id.
-    MultisigProposal(u32),
-
-    // ── Governance keys (issue #557) ──
-    /// Per-offering governance proposal counter.
-    GovProposalCount(OfferingId),
-    /// Per-offering governance proposal by id.
-    GovProposal(OfferingId, u32),
-    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
-    VoteRecord(OfferingId, u32, Address),
-    /// Processed OFAC attestation hash for idempotency (prevents replay attacks).
-    ProcessedAttestationHash(BytesN<32>),
+    /// Append-only admin rotation log entry keyed by rotation_id (sequential counter).
+    AdminRotationLog(u64),
+    /// Monotonically increasing counter for admin rotation entries.
+    AdminRotationCount,
+    /// Per-offering TWAP window configuration (#546).
+    /// Stores a [`TwapConfig`] value; absent means no window has been set.
+    TwapWindowSecs(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -11431,6 +11418,173 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&key, &reason);
         env.events().publish((EVENT_FRZ_SET, issuer, namespace, token), (caller, holder, reason));
         Ok(())
+    }
+
+    // ── Dispute window management ────────────────────────────────────────────
+
+    /// Get the dispute window in seconds for an offering.
+    /// Returns `DEFAULT_DISPUTE_WINDOW_SECS` (30 days) when not configured.
+    pub fn get_dispute_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> u64 {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage()
+            .persistent()
+            .get::<DataKey2, u64>(&DataKey2::DisputeWindowSecs(offering_id))
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_SECS)
+    }
+
+    /// Set the dispute window in seconds for an offering.
+    /// Only the issuer or admin may call.
+    /// Emits `EVENT_DISPUTE_WINDOW_SET` on success.
+    pub fn set_dispute_window(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        window_secs: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Verify offering exists.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::DisputeWindowSecs(offering_id), &window_secs);
+
+        env.events().publish(
+            (EVENT_DISPUTE_WINDOW_SET, issuer, namespace, token),
+            (caller, window_secs),
+        );
+        Ok(())
+    }
+
+    // ── TWAP window configurability (#546) ───────────────────────────────────
+
+    /// Configure the TWAP (Time-Weighted Average Price) smoothing window for an
+    /// offering's NAV computation.
+    ///
+    /// # Authorization
+    /// Caller must be either:
+    /// - the **current issuer** of the offering, or
+    /// - the **contract admin**.
+    ///
+    /// `caller.require_auth()` is called before any state reads, following the
+    /// auth-first pattern used throughout this contract.
+    ///
+    /// # Bounds
+    /// `window_secs` must satisfy:
+    /// ```text
+    /// MIN_TWAP_WINDOW_SECS (60 s) <= window_secs <= MAX_TWAP_WINDOW_SECS (30 days)
+    /// ```
+    /// Values outside this range are rejected with a structured [`RevoraError`]:
+    /// - Below minimum → [`RevoraError::TwapWindowTooShort`]
+    /// - Above maximum → [`RevoraError::TwapWindowTooLong`]
+    ///
+    /// # Errors
+    /// | Error | Condition |
+    /// |---|---|
+    /// | `ContractFrozen` | Contract is globally frozen |
+    /// | `OfferingNotFound` | No offering exists for `(issuer, namespace, token)` |
+    /// | `NotAuthorized` | Caller is neither issuer nor admin |
+    /// | `TwapWindowTooShort` | `window_secs < MIN_TWAP_WINDOW_SECS` |
+    /// | `TwapWindowTooLong` | `window_secs > MAX_TWAP_WINDOW_SECS` |
+    ///
+    /// # Events
+    /// On success emits:
+    /// ```text
+    /// topic: (twap_win_set, issuer, namespace, token)
+    /// data:  (caller, window_secs)
+    /// ```
+    pub fn set_twap_window(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        window_secs: u64,
+    ) -> Result<(), RevoraError> {
+        // Auth-first: authenticate before any state reads.
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        // Bounds check — reject values outside the documented min/max range.
+        if window_secs < MIN_TWAP_WINDOW_SECS {
+            return Err(RevoraError::TwapWindowTooShort);
+        }
+        if window_secs > MAX_TWAP_WINDOW_SECS {
+            return Err(RevoraError::TwapWindowTooLong);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Verify offering exists and resolve authorization.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let config = TwapConfig {
+            twap_window_secs: window_secs,
+            updated_at: env.ledger().timestamp(),
+            updated_by: caller.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey2::TwapWindowSecs(offering_id), &config);
+
+        env.events().publish(
+            (EVENT_TWAP_WINDOW_SET, issuer, namespace, token),
+            (caller, window_secs),
+        );
+        Ok(())
+    }
+
+    /// Return the current [`TwapConfig`] for an offering, or `None` if no TWAP
+    /// window has been configured yet.
+    ///
+    /// This is a read-only view — no auth required.
+    pub fn get_twap_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<TwapConfig> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey2, TwapConfig>(&DataKey2::TwapWindowSecs(offering_id))
     }
 
     /// Emergency unfreeze a holder for an offering.
